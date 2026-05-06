@@ -1,0 +1,127 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IntelliGate Configuration — config.yaml                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+project:
+  name: "IntelliGate"
+  version: "1.0"
+  description: "AI Powered Smart Gate and Security Management System"
+  university: "COMSATS University Islamabad"
+  team:
+    - name: "Hussain Raza"
+      roll: "SP23-BAI-057"
+      modules: [1, 3, 5]
+    - name: "Muhammad Mazhar Afzal"
+      roll: "SP23-BAI-035"
+      modules: [2, 4]
+
+# ── Hardware ──────────────────────────────────────────────────────────────────
+hardware:
+  device: "cuda"          # cuda | cpu | mps
+  camera_index: 0         # Default webcam index
+  camera_width: 1280
+  camera_height: 720
+  fps: 30
+
+# ── Module 1: Face Recognition & Anti-Spoofing ────────────────────────────────
+face_recognition:
+  # Face Detection (MTCNN)
+  detection:
+    min_face_size: 60           # Minimum face size in pixels
+    thresholds: [0.6, 0.7, 0.7] # P-Net, R-Net, O-Net thresholds
+    scale_factor: 0.709
+    margin: 20                  # Pixel margin around detected face
+
+  # ViT-based Face Recognition
+  recognition:
+    model: "vit_base_patch16_224"    # timm model name
+    embedding_dim: 768               # ViT-Base embedding size
+    similarity_threshold: 0.75       # Cosine similarity for match (>= = authorized)
+    top_k: 5                         # Top-K candidates from FAISS search
+    image_size: 224                  # Input image size for ViT
+
+  # Face Database
+  database:
+    path: "module1_face_recognition/database/face_embeddings.h5"
+    stranger_db_path: "module1_face_recognition/database/stranger_embeddings.h5"
+    stranger_retention_days: 90      # BR-03: auto-delete after 90 days
+    repeat_visit_threshold: 3        # FR-08: alert if unknown appears 3+ times
+    repeat_visit_window_hours: 24    # FR-08: within 24-hour window
+
+# ── Anti-Spoofing Pipeline ────────────────────────────────────────────────────
+anti_spoofing:
+  # Master liveness threshold
+  # DEV MODE: 0.75 (TextureCNN not yet trained — LBP-only fallback active)
+  # PRODUCTION: raise back to 0.90 once TextureCNN is trained on NUAA/CASIA-SURF
+  liveness_threshold: 0.75
+
+  # Weight of each sub-check in final liveness score
+  weights:
+    blink: 0.30
+    texture: 0.25
+    depth: 0.30
+    mask: 0.15
+
+  # FE-2: Blink Detection (Eye Aspect Ratio)
+  blink:
+    ear_threshold: 0.25        # EAR below this = eye closed
+    consecutive_frames: 2      # Minimum frames eye must be closed
+    required_blinks: 1         # Minimum blinks needed to pass
+    window_frames: 90          # Check window (3 seconds @ 30fps)
+    mediapipe_confidence: 0.5
+
+  # FE-3: Texture Analysis (LBP + CNN)
+  texture:
+    lbp_radius: 3
+    lbp_n_points: 24
+    lbp_method: "uniform"
+    cnn_model: "ResNet50"      # Backbone for texture feature extraction
+    spoof_threshold: 0.5       # CNN spoof probability threshold
+    # lbp_only_mode: used automatically when no CNN weights are loaded
+
+  # FE-4: Depth-based Liveness (3D Face Validation)
+  # NOTE: MediaPipe Tasks API uses normalized camera-space Z coordinates.
+  # Real face z_variance is ~0.0006–0.0012 (NOT 0.015 which was for world-space).
+  depth:
+    use_mediapipe_3d: true
+    depth_variance_threshold: 0.0003   # Calibrated to MediaPipe normalized Z scale
+    nose_tip_prominence: 0.030         # Real nose protrudes ~0.045–0.055 in this scale
+
+  # FE-5: Mask Detection
+  mask:
+    model: "mask_detector"     # Custom trained mask classifier
+    mask_confidence_threshold: 0.85  # If mask confidence > this → spoof alert
+
+# ── Gate Control ──────────────────────────────────────────────────────────────
+gate:
+  open_duration_seconds: 5
+  auto_close: true
+  emergency_stop_ms: 200       # BR-05: must trigger within 200ms
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"                # DEBUG | INFO | WARNING | ERROR
+  log_dir: "logs/"
+  rotation: "1 day"
+  retention: "12 months"       # Security audit logs retained 12 months
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {module} | {message}"
+
+# ── Performance Targets (from SRS NFRs) ──────────────────────────────────────
+performance:
+  max_latency_ms: 1500         # NFR-P1: face recognition + gate decision
+  min_fps: 15                  # NFR-P4, BR-08
+  target_uptime_pct: 99.5      # NFR-P6
+
+# ── Module 8: Web Dashboard ───────────────────────────────────────────────────
+dashboard:
+  host: "0.0.0.0"
+  port: 8000
+  event_db: "logs/events.db"   # SQLite event log path (relative to intelligate/)
+  cors_origins:
+    - "http://localhost:5173"   # Vite dev server
+    - "http://localhost:3000"   # Alternative dev port
+    - "http://localhost:8000"   # Production (same origin)
+  stream:
+    jpeg_quality: 75
+    max_fps: 30
+  health_broadcast_interval_s: 5  # How often system health is broadcast via WS

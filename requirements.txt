@@ -1,0 +1,54 @@
+# IntelliGate - AI Powered Smart Gate and Security Management System
+# Requirements for Modules 1, 2, 8
+
+# ── Core Deep Learning ────────────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# ── Computer Vision ───────────────────────────────────────────────────────────
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+Pillow>=10.0.0
+
+# ── Face Detection & Alignment ────────────────────────────────────────────────
+facenet-pytorch>=2.5.3          # MTCNN face detector + InceptionResnet
+mediapipe>=0.10.0               # Face mesh, landmark detection (blink/depth)
+
+# ── Vision Transformers & Model Hub ──────────────────────────────────────────
+timm>=0.9.0                     # ViT models (deit, vit-base, etc.)
+transformers>=4.35.0            # HuggingFace ViT models
+
+# ── Scientific Computing ──────────────────────────────────────────────────────
+numpy>=1.24.0
+scipy>=1.11.0
+scikit-learn>=1.3.0             # Cosine similarity, KNN for face matching
+scikit-image>=0.21.0            # LBP texture features
+
+# ── Database & Storage ────────────────────────────────────────────────────────
+faiss-cpu>=1.7.4                # Fast face embedding similarity search
+# faiss-gpu>=1.7.4              # Use this instead if GPU FAISS is available
+h5py>=3.9.0                     # HDF5 for storing face embeddings
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+PyYAML>=6.0.1
+tqdm>=4.66.0
+loguru>=0.7.0
+python-dotenv>=1.0.0
+
+# ── Module 2: Vehicle Recognition ────────────────────────────────────────────
+ultralytics>=8.0.0              # YOLOv8 vehicle + plate detection
+easyocr>=1.7.0                  # License plate OCR
+
+# ── API / Backend ─────────────────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0       # [standard] adds websockets support
+pydantic>=2.4.0
+python-multipart>=0.0.6         # For FastAPI file uploads
+websockets>=12.0                # WebSocket support
+psutil>=5.9.0                   # System CPU/RAM health monitoring
+# pynvml>=11.5.0                # Optional: GPU monitoring (uncomment if nvidia GPU)
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-cov>=4.1.0

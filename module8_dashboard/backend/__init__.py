@@ -1,0 +1,1 @@
+"""IntelliGate Dashboard — FastAPI backend."""
