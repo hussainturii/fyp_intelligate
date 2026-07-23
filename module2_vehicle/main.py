@@ -66,8 +66,8 @@ class IntelliGateModule2:
         → VehicleReID → VehicleDatabase → GateDecision
     """
 
-    def __init__(self, config_path: str = "config/config.yaml") -> None:
-        with open(config_path) as f:
+    def __init__(self, config_path: str = "config/config.yaml", on_event_callback=None) -> None:
+        with open(config_path, encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
         hw  = self.cfg["hardware"]
@@ -96,7 +96,7 @@ class IntelliGateModule2:
             languages=["en"],
             gpu=(self.device == "cuda"),
             n_reads=3,
-            min_confidence=0.30,
+            min_confidence=0.55,
         )
 
         self.reid = VehicleReID(
@@ -114,8 +114,23 @@ class IntelliGateModule2:
 
         self._frame_count = 0
         self._stats = {"total": 0, "granted": 0, "denied": 0, "reid_saves": 0}
+        self.on_event_callback = on_event_callback
+        self._last_logged_time = {}
+        self.cooldown_seconds = 10.0
+        
+        # Vehicle-level deduplication: embedding hash → last_seen_time
+        # Prevents same physical vehicle from being logged multiple times within cooldown
+        self._vehicle_embedding_cache = {}
+        self._vehicle_cache_cooldown = 10.0
 
         logger.success("[Module2] Pipeline ready.")
+
+    def _should_log(self, event_key: str) -> bool:
+        now = time.time()
+        if now - self._last_logged_time.get(event_key, 0.0) >= self.cooldown_seconds:
+            self._last_logged_time[event_key] = now
+            return True
+        return False
 
     # ─────────────────────────────────────────────────────────────────────────
     # Frame Processing
@@ -170,7 +185,7 @@ class IntelliGateModule2:
             best_plate = plates[0]
             # ── Step 3: OCR ──────────────────────────────────────────────────
             ocr_result = self.plate_ocr.read(best_plate.crop)
-            if ocr_result.confidence >= 0.30:
+            if ocr_result.confidence >= 0.55:
                 plate_text = ocr_result.clean_text
                 plate_conf = ocr_result.confidence
                 result["plate_text"] = plate_text
@@ -204,18 +219,49 @@ class IntelliGateModule2:
             result["confidence"]  = db_result.get("similarity", 1.0)
             result["method"]      = db_result.get("method", "unknown")
 
+            if self.on_event_callback and self._should_log(db_result.get("owner_name", "UNKNOWN")):
+                self.on_event_callback({
+                    "module": "vehicle",
+                    "event_type": "access_granted",
+                    "identity": db_result.get("owner_name", "UNKNOWN"),
+                    "confidence": float(result["confidence"]),
+                    "method": result["method"]
+                })
+
             logger.success(
                 f"[Module2] GRANT: {db_result['plate']} "
                 f"({db_result['owner_name']}) via {result['method']}"
             )
         else:
-            # Unknown vehicle
+            # Unknown vehicle — apply embedding-level deduplication
             self._stats["denied"] += 1
             result["decision"] = GateDecision.DENY
 
-            unknown_info = self.db.log_unknown(
-                embedding=embedding, plate=plate_text
-            )
+            # Check if this exact embedding was seen recently (same physical vehicle)
+            embedding_hash = hash(embedding.tobytes())
+            now = time.time()
+            last_seen = self._vehicle_embedding_cache.get(embedding_hash, 0.0)
+            
+            # Only log if enough time has passed since last identical embedding
+            should_log_unknown = (now - last_seen) >= self._vehicle_cache_cooldown
+            
+            if should_log_unknown:
+                self._vehicle_embedding_cache[embedding_hash] = now
+                unknown_info = self.db.log_unknown(
+                    embedding=embedding, plate=plate_text
+                )
+            else:
+                # Skip logging, reuse last info for this embedding
+                unknown_info = {"should_alert": False, "unknown_id": "", "visit_count": 0}
+
+            if self.on_event_callback and should_log_unknown and self._should_log(plate_text if plate_text else "UNKNOWN_VEHICLE"):
+                self.on_event_callback({
+                    "module": "vehicle",
+                    "event_type": "stranger_alert",
+                    "identity": plate_text if plate_text else "UNKNOWN_VEHICLE",
+                    "confidence": float(plate_conf),
+                    "method": "YOLO/OCR" if plate_text else "Re-ID"
+                })
 
             if unknown_info["should_alert"]:
                 result["alerts"].append({

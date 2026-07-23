@@ -32,7 +32,7 @@ from loguru import logger
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'utc')),
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     module      TEXT    NOT NULL,   -- 'face' | 'vehicle'
     event_type  TEXT    NOT NULL,   -- 'authorized' | 'stranger' | 'spoof' | 'known' | 'unknown'
     identity    TEXT,               -- person name or plate number
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS alerts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'utc')),
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     severity    TEXT    NOT NULL,   -- 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
     category    TEXT    NOT NULL,   -- 'repeat_visitor' | 'spoof_attempt' | 'forced_entry' | 'system'
     title       TEXT    NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE TABLE IF NOT EXISTS system_health (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'utc')),
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     cpu_pct     REAL,
     mem_pct     REAL,
     gpu_pct     REAL,
@@ -157,7 +157,7 @@ class EventStore:
             conditions.append("event_type = ?")
             params.append(event_type)
         if since_hours is not None:
-            cutoff = (datetime.utcnow() - timedelta(hours=since_hours)).isoformat()
+            cutoff = (datetime.now() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
             conditions.append("timestamp >= ?")
             params.append(cutoff)
 
@@ -180,7 +180,7 @@ class EventStore:
         """Count events for statistics."""
         conditions = []
         params: List[Any] = []
-        cutoff = (datetime.utcnow() - timedelta(hours=since_hours)).isoformat()
+        cutoff = (datetime.now() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
         conditions.append("timestamp >= ?")
         params.append(cutoff)
         if module:
@@ -234,7 +234,7 @@ class EventStore:
     def resolve_alert(self, alert_id: int) -> bool:
         with self._conn() as conn:
             conn.execute(
-                "UPDATE alerts SET resolved=1, resolved_at=datetime('now','utc') WHERE id=?",
+                "UPDATE alerts SET resolved=1, resolved_at=datetime('now','localtime') WHERE id=?",
                 (alert_id,),
             )
         return True

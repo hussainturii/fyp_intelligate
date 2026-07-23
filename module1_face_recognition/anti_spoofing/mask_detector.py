@@ -21,6 +21,7 @@ Author : Hussain Raza (SP23-BAI-057)
 from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Tuple
 
 import cv2
@@ -106,6 +107,11 @@ class MaskDetector:
         self.confidence_threshold = confidence_threshold
 
         self.model = MaskClassifier(pretrained=True).to(self.device)
+
+        if weights_path is None:
+            default_weights = Path(__file__).resolve().parent / "weights" / "mask_detection_best.pth"
+            if default_weights.exists():
+                weights_path = str(default_weights)
 
         if weights_path:
             try:

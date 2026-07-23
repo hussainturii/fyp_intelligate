@@ -55,6 +55,11 @@ export default function EventLog({ ws }) {
 
   useEffect(() => { load() }, [])
 
+  useEffect(() => {
+    const timer = setInterval(() => load(), 5000)
+    return () => clearInterval(timer)
+  }, [module, evType, sinceH])
+
   // Prepend live events
   useEffect(() => {
     if (!ws?.events?.length) return

@@ -53,11 +53,18 @@ export default function Dashboard({ ws }) {
   const [health, setHealth] = useState(null)
   const [recent, setRecent] = useState([])
 
-  // Fetch on mount
-  useEffect(() => {
+  const loadSnapshot = () => {
     getStats().then(setStats).catch(() => {})
     getHealth().then(setHealth).catch(() => {})
     getEvents({ limit: 10 }).then(rows => setRecent(rows)).catch(() => {})
+  }
+
+  // Fetch on mount
+  useEffect(() => {
+    loadSnapshot()
+
+    const timer = setInterval(loadSnapshot, 5000)
+    return () => clearInterval(timer)
   }, [])
 
   // Update health from WebSocket system ticks
@@ -69,6 +76,7 @@ export default function Dashboard({ ws }) {
   useEffect(() => {
     if (ws.events.length > 0) {
       setRecent(prev => [ws.events[0], ...prev.slice(0, 9)])
+      getStats().then(setStats).catch(() => {})
     }
   }, [ws.events])
 
@@ -102,23 +110,23 @@ export default function Dashboard({ ws }) {
         <StatCard
           icon={CheckCircle}
           label="Authorized Persons"
-          value={stats?.faces_authorized_24h}
+          value={stats?.registered_faces ?? stats?.faces_authorized_24h ?? 0}
           color="bg-green-700"
-          sub="Face recognized"
+          sub={`${stats?.faces_authorized_24h ?? 0} recognized today`}
         />
         <StatCard
           icon={AlertTriangle}
           label="Unknown Faces"
-          value={stats?.faces_stranger_24h}
+          value={stats?.faces_stranger_24h ?? 0}
           color="bg-yellow-700"
           sub="Not in database"
         />
         <StatCard
           icon={Car}
           label="Known Vehicles"
-          value={stats?.vehicles_known_24h}
+          value={stats?.registered_vehicles ?? stats?.vehicles_known_24h ?? 0}
           color="bg-blue-700"
-          sub="Plate / Re-ID matched"
+          sub={`${stats?.vehicles_known_24h ?? 0} matched today`}
         />
         <StatCard
           icon={XCircle}

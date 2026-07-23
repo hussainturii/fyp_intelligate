@@ -79,6 +79,11 @@ export default function Alerts({ ws }) {
 
   useEffect(() => { load() }, [showResolved])
 
+  useEffect(() => {
+    const timer = setInterval(() => load(), 5000)
+    return () => clearInterval(timer)
+  }, [showResolved])
+
   // Prepend live alerts from WebSocket
   useEffect(() => {
     if (!ws?.alerts?.length) return

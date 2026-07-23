@@ -38,10 +38,11 @@ class CameraStream:
     Latest JPEG-encoded frame is always available via `self.frame`.
     """
 
-    def __init__(self, cam_index: int, width: int = 1280, height: int = 720) -> None:
+    def __init__(self, cam_index: int, width: int = 1280, height: int = 720, video_path: Optional[str] = None) -> None:
         self.cam_index = cam_index
         self.width     = width
         self.height    = height
+        self.video_path = video_path
 
         self._cap:     Optional[cv2.VideoCapture] = None
         self._frame:   Optional[bytes] = None       # latest JPEG bytes
@@ -49,26 +50,34 @@ class CameraStream:
         self._thread:  Optional[threading.Thread] = None
         self._lock     = threading.Lock()
         self._fps:     float = 0.0
+        self._pipeline_func = None
+
+    def set_pipeline(self, pipeline_func) -> None:
+        """Set a processing pipeline function that takes a frame and returns a dict with 'annotated_frame'."""
+        with self._lock:
+            self._pipeline_func = pipeline_func
 
     # ── Control ───────────────────────────────────────────────────────────────
 
     def start(self) -> bool:
         """Open camera and start capture thread. Returns True on success."""
-        self._cap = cv2.VideoCapture(self.cam_index)
+        source = self.video_path if self.video_path else self.cam_index
+        self._cap = cv2.VideoCapture(source)
         if not self._cap.isOpened():
-            logger.error(f"[Camera {self.cam_index}] Cannot open camera")
+            logger.error(f"[Camera {self.cam_index}] Cannot open source: {source}")
             return False
 
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self._cap.set(cv2.CAP_PROP_FPS, 30)
+        if not self.video_path:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self._cap.set(cv2.CAP_PROP_FPS, 30)
 
         self._running = True
         self._thread  = threading.Thread(
             target=self._capture_loop, daemon=True, name=f"cam-{self.cam_index}"
         )
         self._thread.start()
-        logger.success(f"[Camera {self.cam_index}] Started")
+        logger.success(f"[Camera {self.cam_index}] Started (source: {source})")
         return True
 
     def stop(self) -> None:
@@ -96,9 +105,25 @@ class CameraStream:
         while self._running:
             ok, frame = self._cap.read()
             if not ok:
-                logger.warning(f"[Camera {self.cam_index}] Frame read failed, retrying...")
-                time.sleep(0.05)
-                continue
+                if self.video_path:
+                    # Loop video file seamlessly
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                else:
+                    logger.warning(f"[Camera {self.cam_index}] Frame read failed, retrying...")
+                    time.sleep(0.05)
+                    continue
+
+            # Apply ML Pipeline if one is set
+            with self._lock:
+                pipeline_func = self._pipeline_func
+            
+            if pipeline_func:
+                try:
+                    result = pipeline_func(frame)
+                    frame = result.get("annotated_frame", frame)
+                except Exception as e:
+                    logger.error(f"[Camera {self.cam_index}] Pipeline Error: {e}")
 
             # Add timestamp overlay
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -162,14 +187,20 @@ class CameraManager:
         cam_index: int,
         width: int = 1280,
         height: int = 720,
+        video_path: Optional[str] = None
     ) -> bool:
         if cam_index in self._cameras:
             return True  # already running
-        cam = CameraStream(cam_index, width, height)
+        cam = CameraStream(cam_index, width, height, video_path)
         if cam.start():
             self._cameras[cam_index] = cam
             return True
         return False
+
+    def set_pipeline(self, cam_index: int, pipeline_func) -> None:
+        """Set the processing pipeline for a specific camera."""
+        if cam_index in self._cameras:
+            self._cameras[cam_index].set_pipeline(pipeline_func)
 
     def remove_camera(self, cam_index: int) -> None:
         if cam_index in self._cameras:

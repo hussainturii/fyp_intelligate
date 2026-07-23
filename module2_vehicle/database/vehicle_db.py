@@ -559,7 +559,7 @@ class VehicleDatabase:
                 "make":          rec.make,
                 "model":         rec.model,
                 "color":         rec.color,
-                "category":      rec.category,
+                "category":      "authorized",
                 "access_count":  rec.access_count,
                 "visit_count":   rec.access_count,
                 "registered_at": datetime.fromtimestamp(rec.registered_at).isoformat()

@@ -39,6 +39,7 @@ import json
 import os
 import sys
 import time
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -80,9 +81,11 @@ with open(_CONFIG_PATH, encoding="utf-8") as f:
 _DASHBOARD_CFG = _CFG.get("dashboard", {})
 _ALLOWED_ORIGINS = _DASHBOARD_CFG.get("cors_origins", ["http://localhost:5173", "http://localhost:3000"])
 _DB_PATH = _ROOT / _DASHBOARD_CFG.get("event_db", "logs/events.db")
+_UPLOAD_DIR = _ROOT / "logs" / "video_uploads"
 _CAM_IDX = _CFG.get("hardware", {}).get("camera_index", 0)
 _CAM_W   = _CFG.get("hardware", {}).get("camera_width",  1280)
 _CAM_H   = _CFG.get("hardware", {}).get("camera_height", 720)
+_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Lazy imports for Module 1 & 2 databases ───────────────────────────────────
 def _get_face_db():
@@ -106,21 +109,68 @@ def _get_vehicle_db():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# App lifecycle
+# App lifecycle & ML Integration
 # ─────────────────────────────────────────────────────────────────────────────
 
 event_store: EventStore
+main_loop: asyncio.AbstractEventLoop
+ml_pipeline_1 = None
+ml_pipeline_2 = None
+
+def on_pipeline_event(event_data: dict) -> None:
+    """Synchronous callback fired from ML threads when an event occurs."""
+    global event_store, main_loop
+    meta_str = json.dumps(event_data.get("meta")) if event_data.get("meta") else None
+    
+    # 1. Log to DB
+    eid = event_store.log_event(
+        module=event_data["module"],
+        event_type=event_data["event_type"],
+        identity=event_data["identity"],
+        confidence=event_data["confidence"],
+        method=event_data["method"],
+        camera_id=event_data.get("camera_id", 0),
+        meta=meta_str,
+    )
+
+    # 2. Broadcast via WS
+    ws_type = "face_event" if event_data["module"] == "face" else "vehicle_event"
+    payload = {
+        "event_id":   eid,
+        "event_type": event_data["event_type"],
+        "identity":   event_data["identity"],
+        "confidence": event_data["confidence"],
+        "method":     event_data["method"],
+        "camera_id":  event_data.get("camera_id", 0),
+    }
+    
+    if main_loop and main_loop.is_running():
+        asyncio.run_coroutine_threadsafe(
+            ws_manager.broadcast_event(ws_type, payload),
+            main_loop
+        )
+        logger.info(f"[EventCallback] Received: {event_data.get('event_type')} | Identity: {event_data.get('identity')} | event_store={'OK' if event_store else 'NONE'} | main_loop={'OK' if main_loop else 'NONE'}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start camera and health-tick background task on startup."""
-    global event_store
+    global event_store, main_loop
+    main_loop = asyncio.get_running_loop()
     event_store = EventStore(str(_DB_PATH))
 
     # Start default camera
     ok = camera_manager.add_camera(_CAM_IDX, _CAM_W, _CAM_H)
     if not ok:
         logger.warning("[Dashboard] Default camera not available — stream will be offline")
+    else:
+        try:
+            global ml_pipeline_1
+            from module1_face_recognition.main import IntelliGateModule1
+            ml_pipeline_1 = IntelliGateModule1(on_event_callback=on_pipeline_event)
+            camera_manager.set_pipeline(_CAM_IDX, ml_pipeline_1.process_frame)
+            logger.info("[Dashboard] Face module loaded as default pipeline.")
+        except Exception as e:
+            logger.error(f"[Dashboard] Failed to load default Face module: {e}")
 
     # Background system health broadcaster
     health_task = asyncio.create_task(_health_broadcast_loop())
@@ -219,6 +269,10 @@ class AlertIn(BaseModel):
     description: Optional[str] = None
     event_id:    Optional[int] = None
 
+class CameraModeIn(BaseModel):
+    mode: str          # "face", "vehicle", "raw"
+    video_path: Optional[str] = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── Stats ────────────────────────────────────────────────────────────────────
@@ -226,7 +280,23 @@ class AlertIn(BaseModel):
 @app.get("/api/stats")
 async def get_stats() -> Dict[str, Any]:
     """Overview counters for the dashboard home page."""
-    return event_store.get_stats()
+    stats = event_store.get_stats()
+
+    # Include total registered counts so cards are non-zero even before gate events
+    try:
+        vdb = _get_vehicle_db()
+        stats["registered_vehicles"] = len(vdb._vehicles) if vdb else 0
+    except Exception:
+        stats["registered_vehicles"] = 0
+
+    try:
+        fdb = _get_face_db()
+        persons = fdb.list_persons() if fdb and hasattr(fdb, "list_persons") else {}
+        stats["registered_faces"] = len(persons)
+    except Exception:
+        stats["registered_faces"] = 0
+
+    return stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -396,6 +466,94 @@ async def start_camera(cam_id: int) -> Dict[str, Any]:
 async def stop_camera(cam_id: int) -> Dict[str, Any]:
     camera_manager.remove_camera(cam_id)
     return {"cam_id": cam_id, "status": "stopped"}
+
+
+@app.post("/api/cameras/{cam_id}/mode")
+async def set_camera_mode(cam_id: int, config: CameraModeIn) -> Dict[str, Any]:
+    """Switch camera mode and lazy-load the appropriate ML pipeline."""
+    global ml_pipeline_1, ml_pipeline_2
+    
+    # 1. Re-initialize camera stream if video_path changed
+    camera_manager.remove_camera(cam_id)
+    ok = camera_manager.add_camera(cam_id, _CAM_W, _CAM_H, video_path=config.video_path)
+    if not ok:
+        raise HTTPException(503, f"Cannot open camera/video source for {cam_id}")
+
+    # 2. Set the pipeline
+    if config.mode == "face":
+        # Free up memory for vehicle module
+        ml_pipeline_2 = None 
+        import gc
+        gc.collect()
+        
+        # Lazy load Module 1
+        if ml_pipeline_1 is None:
+            from module1_face_recognition.main import IntelliGateModule1
+            ml_pipeline_1 = IntelliGateModule1(on_event_callback=on_pipeline_event)
+        camera_manager.set_pipeline(cam_id, ml_pipeline_1.process_frame)
+        
+    elif config.mode == "vehicle":
+        # Free up memory for face module
+        ml_pipeline_1 = None
+        import gc
+        gc.collect()
+        
+        # Lazy load Module 2
+        if ml_pipeline_2 is None:
+            from module2_vehicle.main import IntelliGateModule2
+            ml_pipeline_2 = IntelliGateModule2(on_event_callback=on_pipeline_event)
+        camera_manager.set_pipeline(cam_id, ml_pipeline_2.process_frame)
+        
+    else: # "raw"
+        ml_pipeline_1 = None
+        ml_pipeline_2 = None
+        import gc
+        gc.collect()
+        camera_manager.set_pipeline(cam_id, None)
+
+    return {"cam_id": cam_id, "mode": config.mode, "status": "updated"}
+
+
+@app.post("/api/cameras/{cam_id}/upload-video")
+async def upload_camera_video(
+    cam_id: int,
+    video: UploadFile = File(...),
+    mode: str = Form("vehicle"),
+) -> Dict[str, Any]:
+    """Upload a local video file, save it on the server, and route the camera stream through it."""
+    global ml_pipeline_1, ml_pipeline_2
+
+    if mode != "vehicle":
+        raise HTTPException(400, "Only vehicle mode is supported for uploaded videos")
+
+    suffix = Path(video.filename or "uploaded_video.mp4").suffix or ".mp4"
+    safe_name = f"cam_{cam_id}_{int(time.time())}{suffix}"
+    saved_path = _UPLOAD_DIR / safe_name
+
+    with saved_path.open("wb") as f:
+        shutil.copyfileobj(video.file, f)
+
+    camera_manager.remove_camera(cam_id)
+    ok = camera_manager.add_camera(cam_id, _CAM_W, _CAM_H, video_path=str(saved_path))
+    if not ok:
+        raise HTTPException(503, f"Cannot open uploaded video for {cam_id}")
+
+    ml_pipeline_1 = None
+    import gc
+    gc.collect()
+
+    if ml_pipeline_2 is None:
+        from module2_vehicle.main import IntelliGateModule2
+        ml_pipeline_2 = IntelliGateModule2(on_event_callback=on_pipeline_event)
+    camera_manager.set_pipeline(cam_id, ml_pipeline_2.process_frame)
+
+    return {
+        "cam_id": cam_id,
+        "mode": "vehicle",
+        "status": "updated",
+        "video_path": str(saved_path),
+        "filename": video.filename,
+    }
 
 
 @app.get("/api/stream/{cam_id}")

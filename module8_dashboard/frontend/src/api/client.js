@@ -53,6 +53,25 @@ export const deleteVehicle = (plate) => request(`/vehicles/${encodeURIComponent(
 export const listCameras  = () => request('/cameras')
 export const startCamera  = (id) => request(`/cameras/${id}/start`, { method: 'POST' })
 export const stopCamera   = (id) => request(`/cameras/${id}/stop`,  { method: 'POST' })
+
+export async function uploadVehicleVideo(id, file) {
+  const formData = new FormData()
+  formData.append('video', file)
+  formData.append('mode', 'vehicle')
+
+  const res = await fetch(`${BASE}/cameras/${id}/upload-video`, {
+    method: 'POST',
+    body: formData,
+  })
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(err || `HTTP ${res.status}`)
+  }
+
+  return res.json()
+}
+
 // MJPEG stream must bypass the Vite proxy — connect directly to FastAPI.
 // The Vite proxy buffers responses, which breaks multipart/x-mixed-replace streaming.
 const STREAM_BASE = 'http://localhost:8000/api'

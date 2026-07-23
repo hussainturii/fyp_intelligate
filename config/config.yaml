@@ -51,15 +51,15 @@ face_recognition:
 # ── Anti-Spoofing Pipeline ────────────────────────────────────────────────────
 anti_spoofing:
   # Master liveness threshold
-  # DEV MODE: 0.75 (TextureCNN not yet trained — LBP-only fallback active)
+  # DEV MODE: 0.65 (Reduced to prevent false positives while TextureCNN is untrained)
   # PRODUCTION: raise back to 0.90 once TextureCNN is trained on NUAA/CASIA-SURF
-  liveness_threshold: 0.75
+  liveness_threshold: 0.65
 
   # Weight of each sub-check in final liveness score
   weights:
-    blink: 0.30
-    texture: 0.25
-    depth: 0.30
+    blink: 0.35
+    texture: 0.10
+    depth: 0.40
     mask: 0.15
 
   # FE-2: Blink Detection (Eye Aspect Ratio)

@@ -21,6 +21,7 @@ Author : Hussain Raza (SP23-BAI-057)
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Tuple
 
 import cv2
@@ -122,6 +123,11 @@ class TextureAnalyzer:
         # Build CNN
         self.model = TextureCNN().to(self.device)
         self._cnn_trained = False   # track whether real weights are loaded
+
+        if weights_path is None:
+            default_weights = Path(__file__).resolve().parent / "weights" / "texture_cnn_final.pth"
+            if default_weights.exists():
+                weights_path = str(default_weights)
 
         if weights_path:
             try:

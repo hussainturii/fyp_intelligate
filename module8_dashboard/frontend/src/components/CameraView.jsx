@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { Camera, Play, Square, RefreshCw, Maximize2, Loader } from 'lucide-react'
-import { startCamera, stopCamera } from '../api/client'
+import { Camera, Play, RefreshCw, Maximize2, Loader, Upload } from 'lucide-react'
+import { startCamera, stopCamera, uploadVehicleVideo } from '../api/client'
 
 // Stream goes DIRECTLY to FastAPI — bypasses Vite proxy which buffers MJPEG
 const BACKEND = 'http://localhost:8000'
@@ -9,6 +9,9 @@ function CameraCard({ camId, onRemove }) {
   const [status,   setStatus]   = useState('connecting') // connecting | live | offline
   const [fullscreen, setFullscreen] = useState(false)
   const [retryKey, setRetryKey] = useState(0)
+  const [selectedFile, setSelectedFile] = useState(null)
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState('')
   const timerRef = useRef(null)
 
   const src = `${BACKEND}/api/stream/${camId}?t=${retryKey}`
@@ -34,6 +37,23 @@ function CameraCard({ camId, onRemove }) {
 
   const retry = () => {
     setRetryKey(k => k + 1)
+  }
+
+  const handleUpload = async () => {
+    if (!selectedFile) return
+    setUploading(true)
+    setUploadError('')
+    try {
+      await uploadVehicleVideo(camId, selectedFile)
+      setRetryKey(k => k + 1)
+      setStatus('connecting')
+      setSelectedFile(null)
+    } catch (error) {
+      setUploadError(error.message || 'Upload failed')
+      setStatus('offline')
+    } finally {
+      setUploading(false)
+    }
   }
 
   return (
@@ -113,6 +133,29 @@ function CameraCard({ camId, onRemove }) {
               )}
             </div>
           )}
+        </div>
+
+        <div className="flex flex-col gap-2 rounded-lg border border-white/5 bg-black/20 p-3">
+          <div className="flex items-center gap-2">
+            <input
+              type="file"
+              accept="video/*"
+              onChange={e => setSelectedFile(e.target.files?.[0] || null)}
+              className="block w-full text-xs text-gray-300 file:mr-3 file:rounded-lg file:border-0 file:bg-brand-600 file:px-3 file:py-2 file:text-white hover:file:bg-brand-500"
+            />
+            <button
+              onClick={handleUpload}
+              disabled={!selectedFile || uploading}
+              className="btn-primary whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Upload size={14} /> {uploading ? 'Uploading' : 'Upload video'}
+            </button>
+          </div>
+          <p className="text-[11px] text-gray-500">
+            Select a local vehicle video, upload it, and the backend will run detection on the uploaded file.
+          </p>
+          {uploadError && <p className="text-[11px] text-red-400">{uploadError}</p>}
+          {selectedFile && <p className="text-[11px] text-gray-400 truncate">Selected: {selectedFile.name}</p>}
         </div>
 
         {/* Footer info */}
@@ -212,6 +255,7 @@ export default function CameraView() {
         </p>
         <p>• Test the stream directly in your browser: <code className="font-mono bg-surface px-1 rounded text-gray-300">http://localhost:8000/api/stream/0</code></p>
         <p>• If the stream page shows a JPEG image, the backend is working. If it's blank, check that your camera index (0) is correct.</p>
+        <p>• Use the video upload box on each camera card to test a local file against the vehicle pipeline.</p>
       </div>
     </div>
   )

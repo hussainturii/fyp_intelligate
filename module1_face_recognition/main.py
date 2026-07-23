@@ -64,7 +64,7 @@ class IntelliGateModule1:
         FaceDetector → LivenessDetector → FaceRecognizer → GateDecision
     """
 
-    def __init__(self, config_path: str = "config/config.yaml") -> None:
+    def __init__(self, config_path: str = "config/config.yaml", on_event_callback=None) -> None:
         # Load config
         with open(config_path, encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
@@ -120,8 +120,18 @@ class IntelliGateModule1:
             "total_faces": 0, "authorized": 0,
             "unknown": 0, "spoofs": 0,
         }
+        self.on_event_callback = on_event_callback
+        self._last_logged_time = {}
+        self.cooldown_seconds = 10.0
 
         logger.success("[Module1] Pipeline ready.")
+
+    def _should_log(self, event_key: str) -> bool:
+        now = time.time()
+        if now - self._last_logged_time.get(event_key, 0.0) >= self.cooldown_seconds:
+            self._last_logged_time[event_key] = now
+            return True
+        return False
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main Processing Loop
@@ -193,6 +203,15 @@ class IntelliGateModule1:
             # Log spoof to DB (BR-02)
             self._log_spoof_event(face, live_result)
 
+            if self.on_event_callback and self._should_log("SPOOF"):
+                self.on_event_callback({
+                    "module": "face",
+                    "event_type": "spoof_detected",
+                    "identity": "UNKNOWN",
+                    "confidence": float(result["liveness_score"]),
+                    "method": "liveness"
+                })
+
             # Reset session for next person
             del self.liveness_sessions[session_key]
 
@@ -208,6 +227,15 @@ class IntelliGateModule1:
                 result["identity"]  = rec_result.identity
                 self.db.log_access(rec_result.user_id)
 
+                if self.on_event_callback and self._should_log(rec_result.identity):
+                    self.on_event_callback({
+                        "module": "face",
+                        "event_type": "access_granted",
+                        "identity": rec_result.identity,
+                        "confidence": float(rec_result.confidence),
+                        "method": "FaceID"
+                    })
+
                 logger.success(
                     f"[Module1] ACCESS GRANTED: {rec_result.identity} "
                     f"(sim={rec_result.confidence:.3f})"
@@ -220,6 +248,15 @@ class IntelliGateModule1:
 
                 # Log to stranger database (FR-07)
                 stranger_info = self.db.add_stranger(rec_result.embedding)
+
+                if self.on_event_callback and self._should_log("UNKNOWN_FACE"):
+                    self.on_event_callback({
+                        "module": "face",
+                        "event_type": "stranger_alert",
+                        "identity": "UNKNOWN",
+                        "confidence": float(rec_result.confidence),
+                        "method": "FaceID"
+                    })
 
                 if stranger_info["should_alert"]:
                     result["alerts"].append({

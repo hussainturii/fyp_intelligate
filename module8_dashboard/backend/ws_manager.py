@@ -89,9 +89,10 @@ class ConnectionManager:
         """
         msg = {
             "type":      event_type,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "data":      payload,
         }
+        logger.info(f"[WS] Broadcasting {event_type} to {len(self.active)} clients")
         await self.broadcast(msg)
 
     async def send_personal(
