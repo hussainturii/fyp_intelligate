@@ -1,31 +1,11 @@
-"""
-camera_manager.py — MJPEG Camera Stream Manager
-================================================
-Manages one or more OpenCV capture sources and exposes them
-as async MJPEG streams that FastAPI can serve.
-
-Each camera runs in a background thread that continuously reads frames.
-The latest frame is stored in memory and served to all stream clients
-without them needing to synchronize with each other.
-
-Usage (in FastAPI route)::
-
-    @app.get("/api/stream/{cam_id}")
-    async def stream(cam_id: int):
-        return StreamingResponse(
-            camera_manager.mjpeg_generator(cam_id),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-        )
-
-Author: Hussain Raza (SP23-BAI-057)
-"""
-
+"""Live/webcam and replay capture with a bounded latest-frame inference queue."""
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
 import time
-from typing import AsyncGenerator, Dict, Optional
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -33,225 +13,240 @@ from loguru import logger
 
 
 class CameraStream:
-    """
-    One camera: runs a background thread that reads frames continuously.
-    Latest JPEG-encoded frame is always available via `self.frame`.
-    """
-
-    def __init__(self, cam_index: int, width: int = 1280, height: int = 720, video_path: Optional[str] = None) -> None:
-        self.cam_index = cam_index
-        self.width     = width
-        self.height    = height
+    def __init__(self, cam_index, width=960, height=540, video_path=None, pipeline_func=None):
+        self.cam_index, self.width, self.height = cam_index, width, height
         self.video_path = video_path
+        self._cap = None
+        self._frame = self._snapshot = self._latest = None
+        self._running = False
+        self._thread = self._inference_thread = None
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._pipeline_func = pipeline_func
+        self._sequence = 0
+        self._fps = self._inference_fps = 0.0
+        self.last_error = None
+        self.source_time = 0.0
+        self.actual_resolution = None
+        self.processed_frames = 0
+        self.last_inference_at = None
+        self.last_inference_started = None
 
-        self._cap:     Optional[cv2.VideoCapture] = None
-        self._frame:   Optional[bytes] = None       # latest JPEG bytes
-        self._running: bool = False
-        self._thread:  Optional[threading.Thread] = None
-        self._lock     = threading.Lock()
-        self._fps:     float = 0.0
-        self._pipeline_func = None
-
-    def set_pipeline(self, pipeline_func) -> None:
-        """Set a processing pipeline function that takes a frame and returns a dict with 'annotated_frame'."""
-        with self._lock:
+    def set_pipeline(self, pipeline_func):
+        with self._condition:
             self._pipeline_func = pipeline_func
+            self._condition.notify_all()
 
-    # ── Control ───────────────────────────────────────────────────────────────
-
-    def start(self) -> bool:
-        """Open camera and start capture thread. Returns True on success."""
+    def start(self):
         source = self.video_path if self.video_path else self.cam_index
-        self._cap = cv2.VideoCapture(source)
+        # DirectShow usually avoids the long MSMF webcam startup on Windows.
+        import os
+        if not self.video_path and os.name == 'nt':
+            self._cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+            if not self._cap.isOpened():
+                self._cap.release()
+                self._cap = cv2.VideoCapture(source)
+        else:
+            self._cap = cv2.VideoCapture(source)
         if not self._cap.isOpened():
-            logger.error(f"[Camera {self.cam_index}] Cannot open source: {source}")
+            self._cap.release()
+            self.last_error = 'Cannot open video or camera; check index, permissions and other camera apps'
             return False
-
         if not self.video_path:
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             self._cap.set(cv2.CAP_PROP_FPS, 30)
-
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._running = True
-        self._thread  = threading.Thread(
-            target=self._capture_loop, daemon=True, name=f"cam-{self.cam_index}"
-        )
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name=f'capture-{self.cam_index}')
+        self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True, name=f'inference-{self.cam_index}')
         self._thread.start()
-        logger.success(f"[Camera {self.cam_index}] Started (source: {source})")
+        self._inference_thread.start()
         return True
 
-    def stop(self) -> None:
-        self._running = False
+    def stop(self):
+        with self._condition:
+            self._running = False
+            owner = getattr(self._pipeline_func, '__self__', None)
+            if owner is not None:
+                owner.active = False
+            self._condition.notify_all()
         if self._thread:
-            self._thread.join(timeout=2.0)
-        if self._cap:
-            self._cap.release()
-        logger.info(f"[Camera {self.cam_index}] Stopped")
+            self._thread.join(timeout=3)
+        if self._inference_thread:
+            self._inference_thread.join(timeout=5)
+        # The capture thread owns/release its capture handle; no concurrent reads.
 
     @property
-    def is_running(self) -> bool:
+    def is_running(self):
         return self._running
 
     @property
-    def fps(self) -> float:
+    def fps(self):
         return self._fps
 
-    # ── Capture loop (background thread) ─────────────────────────────────────
-
-    def _capture_loop(self) -> None:
-        frame_count = 0
-        t0 = time.time()
-
-        while self._running:
-            ok, frame = self._cap.read()
-            if not ok:
+    def _capture_loop(self):
+        source_fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if not math.isfinite(source_fps) or not 1 <= source_fps <= 120:
+            source_fps = 24
+        started, interval_start, count, failures = time.monotonic(), time.monotonic(), 0, 0
+        try:
+            while self._running:
+                frame_started = time.monotonic()
+                ok, frame = self._cap.read()
+                if not ok:
+                    if self.video_path:
+                        break
+                    failures += 1
+                    if failures >= 30:
+                        self.last_error = 'Live camera stopped returning frames'
+                        break
+                    time.sleep(.05)
+                    continue
+                failures = 0
+                scale = min(1, self.width / frame.shape[1])
+                if scale < 1:
+                    frame = cv2.resize(frame, None, fx=scale, fy=scale)
+                self.actual_resolution = f'{frame.shape[1]}x{frame.shape[0]}'
+                self.source_time = self._cap.get(cv2.CAP_PROP_POS_MSEC)/1000 if self.video_path else time.monotonic()-started
+                with self._condition:
+                    self._snapshot = frame.copy()
+                    self._latest = frame.copy()  # One pending frame; older frames are replaced.
+                    self._sequence += 1
+                    pipeline = self._pipeline_func
+                    self._condition.notify_all()
+                preview = frame.copy()
+                owner = getattr(pipeline, '__self__', None)
+                if owner is not None and getattr(owner, 'mode', None) == 'low_light':
+                    from .vision import enhance
+                    preview = enhance(preview)
+                elif owner is not None and hasattr(owner, 'overlay_frame'):
+                    preview = owner.overlay_frame(preview)
+                prefix = 'REPLAY' if self.video_path else 'LIVE'
+                cv2.putText(preview, f'{prefix} {self.cam_index} | {self.source_time:.1f}s',
+                            (10,24), cv2.FONT_HERSHEY_SIMPLEX,.6,(255,255,255),2)
+                if self.last_error:
+                    cv2.putText(preview,'PIPELINE ERROR - see source status',(10,50),0,.5,(0,0,255),1)
+                encoded, jpeg = cv2.imencode('.jpg',preview,[cv2.IMWRITE_JPEG_QUALITY,80])
+                if encoded:
+                    with self._lock:
+                        self._frame = jpeg.tobytes()
+                count += 1
+                elapsed = time.monotonic()-interval_start
+                if elapsed >= 1:
+                    self._fps = count/elapsed
+                    interval_start, count = time.monotonic(), 0
+                # Pace files; live capture is paced by the device itself.
                 if self.video_path:
-                    # Loop video file seamlessly
-                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                else:
-                    logger.warning(f"[Camera {self.cam_index}] Frame read failed, retrying...")
-                    time.sleep(0.05)
-                    continue
+                    time.sleep(max(0, 1/source_fps-(time.monotonic()-frame_started)))
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.exception('Capture failed')
+        finally:
+            self._cap.release()
+            with self._condition:
+                self._running = False
+                self._condition.notify_all()
 
-            # Apply ML Pipeline if one is set
-            with self._lock:
-                pipeline_func = self._pipeline_func
-            
-            if pipeline_func:
+    def _inference_loop(self):
+        last_sequence, next_inference = -1, 0.0
+        interval_start, count = time.monotonic(), 0
+        while True:
+            with self._condition:
+                ready=self._condition.wait_for(lambda:not self._running or (self._latest is not None and self._sequence != last_sequence), timeout=.5)
+                if not self._running:
+                    return
+                # A cold webcam can take seconds to produce its first frame.
+                # A condition timeout is not a frame-ready notification.
+                if not ready or self._latest is None or self._sequence == last_sequence:
+                    continue
+                if time.monotonic() < next_inference:
+                    self._condition.wait(timeout=next_inference-time.monotonic())
+                    continue
+                frame = self._latest.copy()
+                last_sequence = self._sequence
+                pipeline = self._pipeline_func
+            if pipeline:
+                inference_started = time.monotonic()
+                self.last_inference_started = inference_started
                 try:
-                    result = pipeline_func(frame)
-                    frame = result.get("annotated_frame", frame)
-                except Exception as e:
-                    logger.error(f"[Camera {self.cam_index}] Pipeline Error: {e}")
+                    pipeline(frame)
+                    self.last_error = None
+                    count += 1
+                    self.processed_frames += 1
+                    self.last_inference_at = time.monotonic()
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    logger.error(f'Inference failed: {exc}')
+                next_inference = inference_started+.2
+            else:
+                next_inference = time.monotonic()+.2
+            elapsed = time.monotonic()-interval_start
+            if elapsed >= 1:
+                self._inference_fps = count/elapsed
+                interval_start, count = time.monotonic(), 0
 
-            # Add timestamp overlay
-            ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            cv2.putText(
-                frame, f"CAM {self.cam_index} | {ts}",
-                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
-            )
-
-            # Encode to JPEG
-            _, jpeg = cv2.imencode(
-                ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
-            )
-
-            with self._lock:
-                self._frame = jpeg.tobytes()
-
-            # FPS tracking
-            frame_count += 1
-            elapsed = time.time() - t0
-            if elapsed >= 2.0:
-                self._fps   = frame_count / elapsed
-                frame_count = 0
-                t0          = time.time()
-
-    # ── Frame access ──────────────────────────────────────────────────────────
-
-    def get_frame(self) -> Optional[bytes]:
-        """Return the latest JPEG frame bytes, or None if not ready."""
+    def get_frame(self):
         with self._lock:
             return self._frame
 
-    def get_snapshot(self) -> Optional[np.ndarray]:
-        """Return the latest frame as an OpenCV BGR array."""
-        if self._cap and self._cap.isOpened():
-            ok, frame = self._cap.read()
-            if ok:
-                return frame
-        return None
+    def get_snapshot(self):
+        with self._lock:
+            return self._snapshot.copy() if self._snapshot is not None else None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Manager
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CameraManager:
-    """
-    Registry of all active camera streams.
+    def __init__(self):
+        self._cameras = {}
 
-    Usage::
-
-        mgr = CameraManager()
-        mgr.add_camera(0)          # start webcam 0
-        frame = mgr.get_frame(0)   # bytes or None
-    """
-
-    def __init__(self) -> None:
-        self._cameras: Dict[int, CameraStream] = {}
-
-    def add_camera(
-        self,
-        cam_index: int,
-        width: int = 1280,
-        height: int = 720,
-        video_path: Optional[str] = None
-    ) -> bool:
+    def add_camera(self, cam_index, width=960, height=540, video_path=None, pipeline_func=None):
         if cam_index in self._cameras:
-            return True  # already running
-        cam = CameraStream(cam_index, width, height, video_path)
-        if cam.start():
-            self._cameras[cam_index] = cam
+            return self._cameras[cam_index].is_running
+        camera = CameraStream(cam_index,width,height,video_path,pipeline_func)
+        if camera.start():
+            self._cameras[cam_index] = camera
             return True
         return False
 
-    def set_pipeline(self, cam_index: int, pipeline_func) -> None:
-        """Set the processing pipeline for a specific camera."""
+    def set_pipeline(self, cam_index, pipeline_func):
         if cam_index in self._cameras:
             self._cameras[cam_index].set_pipeline(pipeline_func)
 
-    def remove_camera(self, cam_index: int) -> None:
-        if cam_index in self._cameras:
-            self._cameras[cam_index].stop()
-            del self._cameras[cam_index]
+    def remove_camera(self, cam_index):
+        camera = self._cameras.pop(cam_index,None)
+        if camera:
+            camera.stop()
 
-    def get_frame(self, cam_index: int) -> Optional[bytes]:
-        cam = self._cameras.get(cam_index)
-        return cam.get_frame() if cam else None
+    def get_frame(self, cam_index):
+        camera = self._cameras.get(cam_index)
+        return camera.get_frame() if camera else None
 
-    def get_snapshot(self, cam_index: int) -> Optional[np.ndarray]:
-        cam = self._cameras.get(cam_index)
-        return cam.get_snapshot() if cam else None
+    def get_snapshot(self, cam_index):
+        camera = self._cameras.get(cam_index)
+        return camera.get_snapshot() if camera else None
 
-    def list_cameras(self) -> Dict[int, Dict]:
-        return {
-            idx: {
-                "index":      idx,
-                "running":    cam.is_running,
-                "fps":        round(cam.fps, 1),
-                "resolution": f"{cam.width}x{cam.height}",
-            }
-            for idx, cam in self._cameras.items()
-        }
+    def list_cameras(self):
+        return {index:{'index':index,'running':camera.is_running,'fps':round(camera.fps,1),
+                       'resolution':camera.actual_resolution,'replayed':bool(camera.video_path),
+                       'source_time_seconds':round(camera.source_time,2),'inference_sampling_fps':5,
+                       'inference_fps':round(camera._inference_fps,1),'last_error':camera.last_error,
+                       'processing_mode':getattr(getattr(camera._pipeline_func,'__self__',None),'mode','custom'),
+                       'worker_alive':bool(camera._inference_thread and camera._inference_thread.is_alive()),
+                       'processed_frames':camera.processed_frames,
+                       'last_inference_age_seconds':round(time.monotonic()-camera.last_inference_at,1) if camera.last_inference_at else None,
+                       'processing_status':('stopped' if not camera.is_running else 'error' if camera.last_error or not camera._inference_thread.is_alive() else 'waiting_for_first_frame' if camera._latest is None else 'starting_inference' if camera.last_inference_at is None else 'stalled' if time.monotonic()-camera.last_inference_at>10 else 'running')}
+                for index,camera in list(self._cameras.items())}
 
-    async def mjpeg_generator(self, cam_index: int) -> AsyncGenerator[bytes, None]:
-        """
-        Async generator that yields MJPEG frames for StreamingResponse.
-
-        Each chunk is a multipart frame boundary + JPEG data.
-        """
-        if cam_index not in self._cameras:
-            logger.warning(f"[CameraManager] Camera {cam_index} not found")
-            return
-
-        while True:
+    async def mjpeg_generator(self, cam_index):
+        while cam_index in self._cameras:
             frame = self.get_frame(cam_index)
             if frame:
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + frame
-                    + b"\r\n"
-                )
-            await asyncio.sleep(1 / 30)  # ~30 FPS max
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame+b'\r\n'
+            await asyncio.sleep(1/30)
 
-    def stop_all(self) -> None:
-        for cam in self._cameras.values():
-            cam.stop()
-        self._cameras.clear()
+    def stop_all(self):
+        for index in list(self._cameras):
+            self.remove_camera(index)
 
 
-# Module-level singleton
 camera_manager = CameraManager()

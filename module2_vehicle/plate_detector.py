@@ -69,6 +69,7 @@ class PlateDetector:
         confidence_threshold: float = 0.40,
         device: str = "cpu",
         model_path: Optional[str] = None,
+        allow_download: bool = True,
     ) -> None:
         self.conf   = confidence_threshold
         self.device = device
@@ -76,10 +77,10 @@ class PlateDetector:
 
         path = Path(model_path) if model_path else _PLATE_MODEL_PATH
 
-        if _YOLO_OK:
+        if _YOLO_OK and (path.exists() or allow_download):
             self._model = self._load_model(path)
         else:
-            logger.warning("[PlateDetector] ultralytics not installed — using classical fallback.")
+            logger.warning("[PlateDetector] Using classical contour baseline (no local plate model).")
 
     # ─────────────────────────────────────────────────────────────────────────
 

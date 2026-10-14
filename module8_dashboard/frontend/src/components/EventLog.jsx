@@ -4,8 +4,8 @@ import { getEvents } from '../api/client'
 import { format } from 'date-fns'
 import clsx from 'clsx'
 
-const MODULE_OPTS  = ['all', 'face', 'vehicle']
-const TYPE_OPTS    = ['all', 'authorized', 'stranger', 'spoof', 'known', 'unknown']
+const MODULE_OPTS  = ['all', 'face', 'vehicle', 'gate', 'access', 'safety', 'queue', 'visitors', 'sources', 'identity']
+const TYPE_OPTS    = ['all', 'recognition_candidate', 'access_granted', 'stranger_alert', 'spoof_detected', 'obstruction', 'count_changed', 'congestion', 'loitering', 'repeat_visitor', 'approved', 'denied', 'state_changed']
 
 function badgeClass(type) {
   return {
@@ -63,20 +63,18 @@ export default function EventLog({ ws }) {
   // Prepend live events
   useEffect(() => {
     if (!ws?.events?.length) return
-    const newest = ws.events[0]
-    if (!newest) return
     setEvents(prev => {
-      // avoid duplicate if already present
-      if (prev[0]?.id === newest.id) return prev
-      return [newest, ...prev.slice(0, 199)]
+      const existing = new Set(prev.map(event=>event.id))
+      const fresh = ws.events.filter(event=>!existing.has(event.id) && (module==='all' || event.module===module) && (evType==='all' || event.event_type===evType))
+      return [...fresh,...prev].slice(0,200)
     })
-  }, [ws?.events])
+  }, [ws?.events, module, evType])
 
   // CSV export
   const handleExport = () => {
     const header = 'id,timestamp,module,event_type,identity,confidence,method,camera_id'
     const rows = events.map(e =>
-      [e.id, e.timestamp, e.module, e.event_type, e.identity ?? '', e.confidence ?? '', e.method ?? '', e.camera_id].join(',')
+      [e.id, e.timestamp, e.module, e.event_type, e.identity ?? '', e.confidence ?? '', e.method ?? '', e.camera_id].map(value => '"' + String(value ?? '').replaceAll('"', '""') + '"').join(',')
     )
     const csv  = [header, ...rows].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
@@ -85,6 +83,7 @@ export default function EventLog({ ws }) {
     a.href     = url
     a.download = `intelligate_events_${Date.now()}.csv`
     a.click()
+    URL.revokeObjectURL(url)
   }
 
   return (

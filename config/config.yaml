@@ -17,7 +17,7 @@ project:
 
 # ── Hardware ──────────────────────────────────────────────────────────────────
 hardware:
-  device: "cuda"          # cuda | cpu | mps
+  device: "cpu"           # Software-only delivery; no GPU required
   camera_index: 0         # Default webcam index
   camera_width: 1280
   camera_height: 720

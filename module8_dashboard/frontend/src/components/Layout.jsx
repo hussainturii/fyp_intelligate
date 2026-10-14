@@ -1,12 +1,14 @@
 import { NavLink, useLocation } from 'react-router-dom'
 import {
-  LayoutDashboard, Camera, List, Users, Car, Bell, Shield, Wifi, WifiOff
+  LayoutDashboard, Camera, List, Users, Car, Bell, Shield, Wifi, WifiOff, Activity
 } from 'lucide-react'
 import clsx from 'clsx'
 
 const NAV = [
   { to: '/',         icon: LayoutDashboard, label: 'Overview'       },
-  { to: '/cameras',  icon: Camera,          label: 'Live Cameras'   },
+  { to: '/cameras',  icon: Camera,          label: 'Camera / Replay'   },
+  { to: '/operations', icon: Shield,       label: 'Operations' },
+  { to: '/testing', icon: Activity,        label: 'Test Center' },
   { to: '/events',   icon: List,            label: 'Event Log'      },
   { to: '/faces',    icon: Users,           label: 'Face Database'  },
   { to: '/vehicles', icon: Car,             label: 'Vehicle DB'     },

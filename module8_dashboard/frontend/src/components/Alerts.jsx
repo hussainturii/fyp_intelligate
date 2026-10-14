@@ -65,6 +65,7 @@ function AlertCard({ alert, onResolve }) {
 }
 
 export default function Alerts({ ws }) {
+  const [error, setError] = useState('')
   const [alerts,       setAlerts]       = useState([])
   const [showResolved, setShowResolved] = useState(false)
   const [loading,      setLoading]      = useState(false)
@@ -96,7 +97,7 @@ export default function Alerts({ ws }) {
   }, [ws?.alerts])
 
   const handleResolve = async (id) => {
-    await resolveAlert(id).catch(() => {})
+    try { await resolveAlert(id); setError('') } catch(e) { setError(e.message); return }
     load()
   }
 
@@ -105,6 +106,7 @@ export default function Alerts({ ws }) {
 
   return (
     <div className="p-6 space-y-6">
+      {error && <p role="alert" className="text-red-400">{error}</p>}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>

@@ -32,7 +32,7 @@ from loguru import logger
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
     module      TEXT    NOT NULL,   -- 'face' | 'vehicle'
     event_type  TEXT    NOT NULL,   -- 'authorized' | 'stranger' | 'spoof' | 'known' | 'unknown'
     identity    TEXT,               -- person name or plate number
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS alerts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
     severity    TEXT    NOT NULL,   -- 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
     category    TEXT    NOT NULL,   -- 'repeat_visitor' | 'spoof_attempt' | 'forced_entry' | 'system'
     title       TEXT    NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 CREATE TABLE IF NOT EXISTS system_health (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
     cpu_pct     REAL,
     mem_pct     REAL,
     gpu_pct     REAL,
@@ -100,7 +100,7 @@ class EventStore:
 
     @contextmanager
     def _conn(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -114,6 +114,7 @@ class EventStore:
     def _init_schema(self) -> None:
         with self._conn() as conn:
             conn.executescript(_SCHEMA)
+            conn.execute('PRAGMA journal_mode=WAL')
 
     # ── Event logging ─────────────────────────────────────────────────────────
 
@@ -132,8 +133,8 @@ class EventStore:
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO events
-                   (module, event_type, identity, confidence, method, camera_id, image_path, meta)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (module, event_type, identity, confidence, method, camera_id, image_path, meta, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
                 (module, event_type, identity, confidence, method, camera_id, image_path, meta),
             )
             return cur.lastrowid
@@ -157,7 +158,7 @@ class EventStore:
             conditions.append("event_type = ?")
             params.append(event_type)
         if since_hours is not None:
-            cutoff = (datetime.now() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (datetime.utcnow() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
             conditions.append("timestamp >= ?")
             params.append(cutoff)
 
@@ -166,7 +167,7 @@ class EventStore:
 
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT * FROM events {where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM events {where} ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?",
                 params,
             ).fetchall()
         return [dict(r) for r in rows]
@@ -180,7 +181,7 @@ class EventStore:
         """Count events for statistics."""
         conditions = []
         params: List[Any] = []
-        cutoff = (datetime.now() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (datetime.utcnow() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
         conditions.append("timestamp >= ?")
         params.append(cutoff)
         if module:
@@ -207,8 +208,8 @@ class EventStore:
     ) -> int:
         with self._conn() as conn:
             cur = conn.execute(
-                """INSERT INTO alerts (severity, category, title, description, event_id)
-                   VALUES (?, ?, ?, ?, ?)""",
+                """INSERT INTO alerts (severity, category, title, description, event_id, timestamp)
+                   VALUES (?, ?, ?, ?, ?, datetime('now'))""",
                 (severity, category, title, description, event_id),
             )
             return cur.lastrowid
@@ -226,18 +227,18 @@ class EventStore:
         params.append(limit)
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT * FROM alerts {where} ORDER BY timestamp DESC LIMIT ?",
+                f"SELECT * FROM alerts {where} ORDER BY timestamp DESC, id DESC LIMIT ?",
                 params,
             ).fetchall()
         return [dict(r) for r in rows]
 
     def resolve_alert(self, alert_id: int) -> bool:
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE alerts SET resolved=1, resolved_at=datetime('now','localtime') WHERE id=?",
+            changed = conn.execute(
+                "UPDATE alerts SET resolved=1, resolved_at=datetime('now') WHERE id=?",
                 (alert_id,),
             )
-        return True
+            return changed.rowcount > 0
 
     def count_open_alerts(self) -> int:
         with self._conn() as conn:
@@ -276,11 +277,11 @@ class EventStore:
     def get_stats(self) -> Dict[str, Any]:
         """Summary counters for the dashboard Overview card."""
         return {
-            "faces_authorized_24h":  self.count_events("face",    "authorized",  24),
-            "faces_stranger_24h":    self.count_events("face",    "stranger",    24),
-            "faces_spoof_24h":       self.count_events("face",    "spoof",       24),
-            "vehicles_known_24h":    self.count_events("vehicle", "known",       24),
-            "vehicles_unknown_24h":  self.count_events("vehicle", "unknown",     24),
+            "faces_authorized_24h":  self.count_events("face",    "access_granted",  24),
+            "faces_stranger_24h":    self.count_events("face",    "stranger_alert",  24),
+            "faces_spoof_24h":       self.count_events("face",    "spoof_detected",  24),
+            "vehicles_known_24h":    self.count_events("vehicle", "access_granted",  24),
+            "vehicles_unknown_24h":  self.count_events("vehicle", "stranger_alert",  24),
             "open_alerts":           self.count_open_alerts(),
             "total_events_24h":      self.count_events(since_hours=24),
         }

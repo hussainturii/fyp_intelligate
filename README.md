@@ -1,155 +1,89 @@
-# IntelliGate
+# IntelliGate - CPU software prototype
 
-IntelliGate is an AI-powered smart gate and security management system for controlled entry points such as homes, offices, campuses, parking areas, and secure facilities. It combines live face recognition, anti-spoofing, vehicle recognition, license-plate OCR, re-identification, and a web dashboard for monitoring and review.
+An integrated live-webcam and recorded-video security dashboard built from the existing FYP codebase. Physical gate sensors and actuators are excluded. All gate actions are simulated. Webcams open only on explicit operator request.
 
-## What It Does
+The current delivery includes multi-face tracking with cached identities, face/vehicle enrolment, CPU recognition candidates, operator approvals, a persistent virtual gate, stranger visit rules, queue/obstruction/dwell analytics, low-light enhancement, real infrared replay, event history and evidence reports. See the [module testing guide](docs/MODULE_TEST_GUIDE.md), [delivery status and measured limitations](docs/DAY1_DAY2_STATUS.md) and [initial software-only scope](docs/SOFTWARE_ONLY_DELIVERY_PLAN.md).
 
-IntelliGate is built around three working layers:
+The [Test Center](docs/TEST_CENTER.md) adds isolated component checks, current-camera diagnosis and image/video tests with expected names/counts and downloadable evidence. The 14 October fix prevents a delayed first webcam frame from silently killing recognition while the preview continues. Restart the backend and refresh the dashboard to load it.
 
-1. Face access control with liveness detection.
-2. Vehicle access control with plate recognition and vehicle re-identification.
-3. A live dashboard for events, alerts, camera state, and system health.
+## Quick start
 
-The backend logs access decisions and suspicious activity so operators can review attempts, track repeat strangers, and inspect historical events.
+Python 3.11 and Node.js are verified on the development host. A GPU is not needed.
 
-## Working Features
+Install CPU PyTorch first, then runtime dependencies:
 
-- Face detection, alignment, and recognition for authorized users.
-- Anti-spoofing checks using blink, texture, depth, and mask signals.
-- Stranger face logging with repeat-visit detection.
-- Vehicle detection, plate detection, and OCR.
-- Vehicle re-identification when a plate is unclear or obscured.
-- Access decision logging for granted, denied, spoof, and unknown events.
-- Live dashboard with stats, recent activity, alerts, and system health.
-- WebSocket updates for live event streaming.
-- Camera preview and MJPEG streaming through the dashboard backend.
-
-## Where It Can Be Used
-
-### Working use cases
-
-- Residential gate automation.
-- Office and company entrance control.
-- Campus or university access points.
-- Parking lot entry and exit management.
-- Restricted zone monitoring in labs, warehouses, or server rooms.
-- Security logging for reception desks and guard stations.
-
-### Potential use cases
-
-- Visitor management with pre-registration and audit trails.
-- Attendance-style access history for staff or members.
-- Multi-camera perimeter monitoring.
-- Smart parking with plate-based whitelisting.
-- Incident review and evidence collection for security teams.
-- Integration with barriers, relays, or turnstiles in a production gate system.
-
-## Project Structure
-
-- `module1_face_recognition/` handles face recognition and anti-spoofing.
-- `module2_vehicle/` handles vehicle detection, plate OCR, and re-identification.
-- `module8_dashboard/` provides the FastAPI backend and React frontend.
-- `config/config.yaml` stores runtime and model settings.
-- `logs/` stores runtime event data, uploads, and spoof snapshots locally.
-
-Large local assets such as model weights, generated logs, uploads, build output, and snapshots are intentionally excluded from version control.
-
-## Requirements
-
-- Python 3.10+ recommended.
-- Node.js 18+ for the dashboard frontend.
-- A webcam or compatible camera for live mode.
-- Optional CUDA-capable GPU for faster inference.
-
-## Installation
-
-Install the Python dependencies first:
-
-```bash
-pip install -r requirements.txt
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-cpu.txt -c constraints-cpu.txt
+python tools/download_face_models.py
+python tools/prepare_demo_data.py
 ```
 
-Install the frontend dependencies:
+`constraints-cpu.txt` records direct package versions tested on this Windows machine; it is not a complete transitive lockfile or a cross-platform compatibility guarantee. The legacy `requirements.txt` additionally supports the original research pipelines.
 
-```bash
-cd module8_dashboard/frontend
-npm install
+Build the dashboard and start the backend from the repository root:
+
+```powershell
+Push-Location module8_dashboard/frontend
+npm ci
+npm run build
+Pop-Location
+python -m uvicorn module8_dashboard.backend.main:app --host 127.0.0.1 --port 8000
 ```
 
-## Run the Dashboard Stack
+Open http://127.0.0.1:8000. Create your first local administrator account using a password of at least ten characters. There is no default password. Subsequent users can be created on the Operations page as administrator, security staff or viewer.
 
-Start the backend API and live event service from the repository root:
+`start_intelligate.bat` starts the backend on loopback using the already-built frontend. For frontend development, run `npm run dev` in the frontend folder and open http://localhost:5173 with the backend running. Use the same hostname consistently so cookie sessions work.
 
-```bash
-uvicorn module8_dashboard.backend.main:app --reload --port 8000
+## Demonstration walkthrough
+
+1. On **Face Database**, enrol a clear, permitted single-face image. CPU SFace records are separate from legacy ViT records. New face/stranger embeddings are encrypted with AES-256-GCM.
+2. On **Vehicle DB**, register a plate and owner. An optional cropped vehicle image provides a colour-histogram appearance baseline.
+3. On **Camera / Replay**, choose face mode and press Open live camera (index 0), or upload/select a recorded clip. Capture/preview and inference use separate threads with a single pending frame. Only one source runs at a time; recordings stop at EOF.
+4. Face candidates and appearance matches appear in **Operations -> Access review**. An authorized operator can approve/deny within two minutes. Unvalidated liveness cannot auto-open the virtual gate.
+5. Use **scene** mode for person/vehicle detection, ROI counts, obstruction and dwell rules. Configure the blue queue ROI and red virtual-gate-path ROI on Operations.
+6. Demonstrate OPEN/CLOSE/STOP/LOCKDOWN/RESET. Obstruction prevents motion; STOP cancels pending transitions. Active motion becomes STOPPED after backend restart.
+7. Inspect persisted events and alerts. Generate/download the last-24-hour evidence report or search supported terms such as `face today`, `vehicle`, `queue`, `spoof` and `obstruction`.
+
+The static OpenCV face sample is for recognition smoke tests only. It is a repeated photograph, so it cannot demonstrate liveness. LLVIP samples are split from the official paired illustration and contain genuine infrared imagery; they are unannotated visualization data, not a test-set accuracy benchmark. Identity recognition on LLVIP is disabled for curated samples.
+
+## CPU and model limits
+
+- YuNet + SFace provide lightweight pretrained detection/recognition. A provisional 0.45 cosine threshold is used; local identity-disjoint calibration is still needed.
+- Known faces get green name boxes, unknown faces red boxes, and each visible face has a separate track. Matching/OCR is cached for continuous tracks. A two-second absence ends an appearance. Ambiguous tracking or gallery updates can trigger a fresh match; continuously present identities do not receive timed repeat events.
+- No validated anti-spoof model is connected to this new CPU face path. Manual approval is required for every face match, including static/replay inputs.
+- YOLOv8n detects people/vehicles. EasyOCR reads plate crops. The original specialized plate-model URL currently returns 404; plate localization falls back to OpenCV contours.
+- Vehicle appearance uses colour histograms, not trained ViT/OSNet Re-ID. Appearance candidates always require review.
+- Scene tracking is a basic IoU baseline. Queue/dwell rules do not establish behavioural intent or SSM prediction.
+- CLAHE is classical enhancement, not a trained low-light network. Recorded infrared uses an RGB-trained detector and its accuracy is unvalidated.
+- Reports use stored-event templates and search uses a limited keyword parser. These are not LLaVA/VLM inference.
+- Playback FPS and inference sampling differ. Sampled scene inference measured about 6.7 FPS on this host; the full-pipeline 15 FPS SRS target is unmet.
+- SQLite/HDF5 remains. This is a local software demonstration, without physical safety, PostgreSQL, production TLS, immutable audit or 99.5% uptime claims.
+
+The dashboard status panel discloses these implementation choices for all ten SRS modules. The original modules 1 and 2 remain in the repository for research; the integrated CPU dashboard uses `module8_dashboard/backend/vision.py` and a separate new gallery.
+
+## Tests and benchmarks
+
+```powershell
+python -m pytest tests -q
+python tools/run_project_checks.py
+python tools/benchmark_cpu.py --video "D:\fyp\nre\video test.mp4" --frames 8
+python tools/benchmark_llvip.py
 ```
 
-In another terminal, start the frontend:
+Benchmark JSON is saved under `logs/benchmarks/`. Timings measure warmed sampled inference, not annotated accuracy or end-to-end actuator latency. Optional model smoke tests require the face-model and demo-data preparation commands above.
 
-```bash
-cd module8_dashboard/frontend
-npm run dev
-```
+## Local data and recovery
 
-Open the Vite URL shown in the terminal, usually `http://localhost:5173`.
+- Events/accounts/sessions/reviews/device state: `logs/events.db`.
+- New vehicle gallery: `logs/cpu_vehicles.h5`.
+- Encrypted face/stranger records: tables inside the event database.
+- Face encryption key: `logs/biometric.key`. Preserve this key with database backups; losing it prevents decryption. Never commit it.
+- Clips, sample provenance and model hashes: `logs/video_uploads`, `logs/demo_data/manifest.json` and `models/download_manifest.json`.
+- `IG_EVENT_DB` can select an isolated database path for tests. Related runtime data is placed beside that database.
 
-## Run The Individual Modules
+Old event rows retain their previous timestamps; new events use UTC. Existing plaintext legacy HDF5 biometric files are not automatically encrypted or migrated by this delivery.
 
-Face recognition module:
-
-```bash
-python -m module1_face_recognition.main --mode webcam
-```
-
-Register a new face:
-
-```bash
-python -m module1_face_recognition.main --mode register
-```
-
-Test on a static image:
-
-```bash
-python -m module1_face_recognition.main --mode test
-```
-
-Vehicle module:
-
-```bash
-python -m module2_vehicle.main --mode webcam
-```
-
-Register a vehicle:
-
-```bash
-python -m module2_vehicle.main --mode register --plate "ABC-1234" --owner "Name"
-```
-
-Test vehicle recognition on an image:
-
-```bash
-python -m module2_vehicle.main --mode test --image path/to/image.jpg
-```
-
-## API and Dashboard Behavior
-
-The dashboard backend exposes REST endpoints for event history, alerts, face records, vehicle records, health monitoring, camera management, and live streams. It also publishes live updates through WebSocket so the UI stays current without page refreshes.
-
-On startup, the backend loads the face pipeline for the default camera stream and can also load the vehicle module and shared databases when the relevant endpoints are used.
-
-## Configuration
-
-Most runtime settings live in `config/config.yaml`:
-
-- camera index, frame size, and device selection.
-- face recognition thresholds and database paths.
-- anti-spoofing thresholds and model weights.
-- dashboard host, port, and CORS settings.
-
-Adjust this file before deployment if you want to change the camera source, processing device, or access thresholds.
-
-## Notes
-
-- Generated files, snapshots, caches, and large assets should stay out of GitHub.
-- Keep the code, modules, configuration, and frontend source in the repository.
-- If you want a production deployment later, the next step is usually to package the backend, build the frontend, and wire the gate output to a physical controller.
+Model/dataset weights and recordings stay out of Git. Dataset/model use terms still apply; generated sample metadata records the primary sources. LLVIP source: https://github.com/bupt-ai-cz/LLVIP (Jia et al., ICCV Workshops 2021).

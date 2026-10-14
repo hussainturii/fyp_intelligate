@@ -109,7 +109,7 @@ export default function Dashboard({ ws }) {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           icon={CheckCircle}
-          label="Authorized Persons"
+          label="Registered Faces"
           value={stats?.registered_faces ?? stats?.faces_authorized_24h ?? 0}
           color="bg-green-700"
           sub={`${stats?.faces_authorized_24h ?? 0} recognized today`}
@@ -123,7 +123,7 @@ export default function Dashboard({ ws }) {
         />
         <StatCard
           icon={Car}
-          label="Known Vehicles"
+          label="Registered Vehicles"
           value={stats?.registered_vehicles ?? stats?.vehicles_known_24h ?? 0}
           color="bg-blue-700"
           sub={`${stats?.vehicles_known_24h ?? 0} matched today`}
@@ -161,7 +161,7 @@ export default function Dashboard({ ws }) {
             color="text-green-400"
           />
           <div className="flex justify-between text-xs pt-1 border-t border-surface-border">
-            <span className="text-gray-500">Camera FPS</span>
+            <span className="text-gray-500">Replay FPS</span>
             <span className="text-white font-mono">{health?.fps ?? '—'}</span>
           </div>
           <div className="flex justify-between text-xs">

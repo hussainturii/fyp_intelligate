@@ -1,262 +1,53 @@
-import { useState, useEffect, useRef } from 'react'
-import { Camera, Play, RefreshCw, Maximize2, Loader, Upload } from 'lucide-react'
-import { startCamera, stopCamera, uploadVehicleVideo } from '../api/client'
+import { useEffect, useState } from 'react'
+import { listCameras, uploadVehicleVideo, stopCamera, streamUrl, request } from '../api/client'
 
-// Stream goes DIRECTLY to FastAPI — bypasses Vite proxy which buffers MJPEG
-const BACKEND = 'http://localhost:8000'
+const MODES = { raw: 'Raw playback', face: 'Face candidates (manual liveness review)', vehicle: 'Vehicle detection / OCR', scene: 'Queue / obstruction / dwell rules', low_light: 'RGB low-light enhancement', thermal: 'Genuine infrared input (unvalidated detector)' }
 
-function CameraCard({ camId, onRemove }) {
-  const [status,   setStatus]   = useState('connecting') // connecting | live | offline
-  const [fullscreen, setFullscreen] = useState(false)
-  const [retryKey, setRetryKey] = useState(0)
-  const [selectedFile, setSelectedFile] = useState(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadError, setUploadError] = useState('')
-  const timerRef = useRef(null)
-
-  const src = `${BACKEND}/api/stream/${camId}?t=${retryKey}`
-
-  // Give the stream 6 seconds to show first frame before declaring offline
-  useEffect(() => {
-    setStatus('connecting')
-    timerRef.current = setTimeout(() => {
-      setStatus(s => s === 'connecting' ? 'offline' : s)
-    }, 6000)
-    return () => clearTimeout(timerRef.current)
-  }, [retryKey])
-
-  const handleLoad = () => {
-    clearTimeout(timerRef.current)
-    setStatus('live')
+export default function CameraView({ user }) {
+  const [sources, setSources] = useState({})
+  const [mode, setMode] = useState('face')
+  const [cameraId, setCameraId] = useState(0)
+  const [file, setFile] = useState(null)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [version, setVersion] = useState(0)
+  const [metrics, setMetrics] = useState({})
+  const [samples, setSamples] = useState([])
+  const [sample, setSample] = useState('local_vehicle')
+  async function load() {
+    try { setSources(await listCameras()); const status = await request('/modules'); setMetrics(status.pipelines) }
+    catch (e) { setError(e.message) }
   }
-
-  const handleError = () => {
-    clearTimeout(timerRef.current)
-    setStatus('offline')
+  useEffect(() => { load(); request('/demo/sources').then(setSamples).catch(e => setError(e.message)); const timer=setInterval(load,2000); return () => clearInterval(timer) }, [])
+  async function upload(e) {
+    e.preventDefault(); setBusy(true); setError('')
+    try { await uploadVehicleVideo(0,file,mode); setVersion(v => v+1); await load() }
+    catch (e) { setError(e.message) } finally { setBusy(false) }
   }
-
-  const retry = () => {
-    setRetryKey(k => k + 1)
-  }
-
-  const handleUpload = async () => {
-    if (!selectedFile) return
-    setUploading(true)
-    setUploadError('')
-    try {
-      await uploadVehicleVideo(camId, selectedFile)
-      setRetryKey(k => k + 1)
-      setStatus('connecting')
-      setSelectedFile(null)
-    } catch (error) {
-      setUploadError(error.message || 'Upload failed')
-      setStatus('offline')
-    } finally {
-      setUploading(false)
-    }
-  }
-
-  return (
-    <>
-      <div className="card flex flex-col gap-3">
-        {/* Header */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Camera size={16} className="text-brand-400" />
-            <span className="font-medium text-white text-sm">Camera {camId}</span>
-          </div>
-          <div className="flex items-center gap-1">
-            {status === 'live' && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-green-900/40 text-green-400 border border-green-800">
-                <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                Live
-              </span>
-            )}
-            {status === 'connecting' && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-yellow-900/40 text-yellow-400 border border-yellow-800">
-                Connecting…
-              </span>
-            )}
-            {status === 'offline' && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-red-900/40 text-red-400 border border-red-800">
-                Offline
-              </span>
-            )}
-            {status === 'live' && (
-              <button
-                onClick={() => setFullscreen(true)}
-                className="btn-ghost p-1.5 rounded-lg ml-1"
-                title="Fullscreen"
-              >
-                <Maximize2 size={14} />
-              </button>
-            )}
-            <button onClick={retry} className="btn-ghost p-1.5 rounded-lg" title="Retry">
-              <RefreshCw size={13} />
-            </button>
-          </div>
-        </div>
-
-        {/* Stream */}
-        <div className="relative bg-black rounded-lg overflow-hidden aspect-video">
-          {/* Always render the img — browser will stream MJPEG automatically */}
-          <img
-            key={retryKey}
-            src={src}
-            alt={`Camera ${camId}`}
-            className="w-full h-full object-cover"
-            onLoad={handleLoad}
-            onError={handleError}
-            style={{ display: status === 'live' ? 'block' : 'none' }}
-          />
-
-          {/* Overlay for non-live states */}
-          {status !== 'live' && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-gray-500">
-              {status === 'connecting' ? (
-                <>
-                  <Loader size={28} className="animate-spin text-brand-400" />
-                  <p className="text-xs text-gray-400">Connecting to camera…</p>
-                  <p className="text-xs text-gray-600 font-mono">{BACKEND}/api/stream/{camId}</p>
-                </>
-              ) : (
-                <>
-                  <Camera size={28} className="text-gray-600" />
-                  <p className="text-xs text-gray-400">Stream unavailable</p>
-                  <button
-                    onClick={retry}
-                    className="text-xs text-brand-400 hover:text-brand-300 border border-brand-600/40 px-3 py-1 rounded-lg"
-                  >
-                    Retry
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-        </div>
-
-        <div className="flex flex-col gap-2 rounded-lg border border-white/5 bg-black/20 p-3">
-          <div className="flex items-center gap-2">
-            <input
-              type="file"
-              accept="video/*"
-              onChange={e => setSelectedFile(e.target.files?.[0] || null)}
-              className="block w-full text-xs text-gray-300 file:mr-3 file:rounded-lg file:border-0 file:bg-brand-600 file:px-3 file:py-2 file:text-white hover:file:bg-brand-500"
-            />
-            <button
-              onClick={handleUpload}
-              disabled={!selectedFile || uploading}
-              className="btn-primary whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Upload size={14} /> {uploading ? 'Uploading' : 'Upload video'}
-            </button>
-          </div>
-          <p className="text-[11px] text-gray-500">
-            Select a local vehicle video, upload it, and the backend will run detection on the uploaded file.
-          </p>
-          {uploadError && <p className="text-[11px] text-red-400">{uploadError}</p>}
-          {selectedFile && <p className="text-[11px] text-gray-400 truncate">Selected: {selectedFile.name}</p>}
-        </div>
-
-        {/* Footer info */}
-        <div className="text-xs text-gray-600 font-mono">
-          {BACKEND}/api/stream/{camId}
-        </div>
-      </div>
-
-      {/* Fullscreen modal */}
-      {fullscreen && (
-        <div
-          className="fixed inset-0 bg-black/95 z-50 flex items-center justify-center p-4"
-          onClick={() => setFullscreen(false)}
-        >
-          <div className="relative max-w-5xl w-full" onClick={e => e.stopPropagation()}>
-            <button
-              className="absolute -top-10 right-0 text-gray-400 hover:text-white text-sm"
-              onClick={() => setFullscreen(false)}
-            >
-              ✕ Close
-            </button>
-            <img
-              src={src}
-              alt={`Camera ${camId} fullscreen`}
-              className="w-full rounded-xl"
-            />
-          </div>
-        </div>
-      )}
-    </>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-
-export default function CameraView() {
-  const [camIds, setCamIds] = useState([0])   // start with cam 0
-  const [addId,  setAddId]  = useState('')
-
-  const handleAdd = async () => {
-    const id = parseInt(addId, 10)
-    if (isNaN(id) || camIds.includes(id)) return
-    await startCamera(id).catch(() => {})
-    setCamIds(prev => [...prev, id])
-    setAddId('')
-  }
-
-  const handleRemove = (id) => {
-    stopCamera(id).catch(() => {})
-    setCamIds(prev => prev.filter(c => c !== id))
-  }
-
-  return (
-    <div className="p-6 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-white">Live Cameras</h1>
-          <p className="text-sm text-gray-500 mt-0.5">
-            MJPEG streams — direct to backend on port 8000
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <input
-            type="number"
-            placeholder="Camera index"
-            value={addId}
-            onChange={e => setAddId(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && handleAdd()}
-            className="input w-32"
-            min="0"
-          />
-          <button onClick={handleAdd} className="btn-primary">
-            <Play size={14} /> Add
-          </button>
-        </div>
-      </div>
-
-      {/* Camera grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {camIds.map(id => (
-          <CameraCard
-            key={id}
-            camId={id}
-            onRemove={handleRemove}
-          />
-        ))}
-      </div>
-
-      {/* Help card */}
-      <div className="card text-xs text-gray-500 space-y-1">
-        <p className="text-white font-medium text-sm">Troubleshooting</p>
-        <p>• Make sure the backend is running:
-          <code className="ml-1 font-mono bg-surface px-1 rounded text-gray-300">
-            uvicorn module8_dashboard.backend.main:app --port 8000
-          </code>
-        </p>
-        <p>• Test the stream directly in your browser: <code className="font-mono bg-surface px-1 rounded text-gray-300">http://localhost:8000/api/stream/0</code></p>
-        <p>• If the stream page shows a JPEG image, the backend is working. If it's blank, check that your camera index (0) is correct.</p>
-        <p>• Use the video upload box on each camera card to test a local file against the vehicle pipeline.</p>
-      </div>
-    </div>
-  )
+  return <div className="p-6 space-y-6">
+    <h1 className="text-2xl font-bold">Live camera and video replay</h1>
+    <p className="text-gray-400">One source at a time on CPU. Capture runs independently of inference. Known faces are green; unknown faces are red. Recognition is cached while each person remains tracked.</p>
+    <div className="card flex flex-wrap gap-3 items-end"><label>Webcam index<input type="number" min="0" max="7" className="input block w-24" value={cameraId} onChange={e=>setCameraId(Number(e.target.value))} /></label><label>Processing mode<select className="input block" value={mode} onChange={e=>setMode(e.target.value)}>{Object.entries(MODES).map(([id,label])=><option key={id} value={id}>{label}</option>)}</select></label><button className="btn-primary" disabled={busy || user?.role==='viewer'} onClick={async()=>{setBusy(true);setError('');try{await request(`/cameras/${cameraId}/start?mode=${mode}`,{method:'POST'});setVersion(v=>v+1);await load()}catch(e){setError(e.message)}finally{setBusy(false)}}}>{busy?'Opening…':'Open live camera'}</button><p className="text-xs text-gray-400 w-full">Index 0 is usually the built-in webcam. The browser displays the backend camera stream; it does not request browser camera permission. Close other camera apps if opening fails. Gate control remains simulated.</p></div>
+    <form onSubmit={upload} className="card flex flex-wrap gap-3 items-end">
+      <label>Video (up to 250 MB)<input type="file" className="input block" accept=".mp4,.avi,.mov,.mkv,.webm" required onChange={e => setFile(e.target.files[0])} /></label>
+      <label>Processing mode<select className="input block" value={mode} onChange={e => setMode(e.target.value)}>{Object.entries(MODES).map(([id,label]) => <option key={id} value={id}>{label}</option>)}</select></label>
+      <button disabled={busy || !file || user?.role==='viewer'} className="btn-primary">{busy ? 'Loading pipeline…' : 'Upload and replay'}</button>
+    </form>
+    {samples.length > 0 && <div className="card flex flex-wrap gap-3 items-center"><select className="input" value={sample} onChange={e => setSample(e.target.value)}>{samples.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}</select><button disabled={busy} className="btn-ghost" onClick={async () => { setBusy(true); setError(''); try { await request('/demo/replay', { method:'POST', body:JSON.stringify({source:sample,mode}) }); setVersion(v=>v+1); await load() } catch(e) { setError(e.message) } finally { setBusy(false) } }}>Replay sample in selected mode</button><p className="text-xs text-gray-400 w-full">LLVIP samples are official illustration material, not an annotated evaluation split. Static face samples cannot validate liveness.</p></div>}
+    {mode === 'thermal' && <p className="text-amber-300">Use genuine infrared/thermal recordings. RGB false-colour images do not validate thermal performance. This detector was trained on RGB.</p>}
+    {error && <div className="card text-red-400" role="alert">{error}</div>}
+    {Object.entries(sources).map(([id, source]) => <section key={id} className="card space-y-3">
+      <div className="flex justify-between"><h2>Source {id} · {source.running ? source.replayed ? 'Replaying' : 'Live camera' : 'Stopped / finished'}</h2><button className="btn-danger" disabled={user?.role==='viewer'} onClick={async () => { try { await stopCamera(id); await load() } catch(e) { setError(e.message) } }}>Stop source</button></div>
+      <img key={`${id}-${version}`} src={streamUrl(id)} alt="Live or recorded video with recognition overlays" className="w-full max-w-3xl rounded-lg bg-black" />
+      <p className="text-sm text-gray-400">Position {source.source_time_seconds}s · capture/preview {source.fps} FPS · detector {source.inference_fps} FPS (cap {source.inference_sampling_fps}) · last inference {metrics[id]?.latency_ms ?? '—'} ms</p>
+      <p className="text-sm text-gray-400">Visible tracks {metrics[id]?.visible_tracks ?? 0} · identity/OCR runs {metrics[id]?.recognition_runs ?? 0} · cache hits {metrics[id]?.recognition_cache_hits ?? 0}</p>
+      <p className={source.processing_status==='error' || source.processing_status==='stalled' ? 'text-red-400':'text-gray-300'}>Active mode: {source.processing_mode} · recognition worker: {source.processing_status} · processed frames: {source.processed_frames ?? 0}</p>
+      {source.processing_mode==='raw' && <p className="text-amber-300">Raw preview does not recognize faces. Select Face mode and reopen the camera.</p>}
+      {source.processing_mode==='face' && source.processing_status==='running' && <p className="text-sm text-gray-300">Faces detected: {metrics[id]?.faces_detected ?? 0} · known: {metrics[id]?.recognized_faces ?? 0} · unknown: {metrics[id]?.unknown_faces ?? 0} · too small: {metrics[id]?.pending_faces ?? 0}</p>}
+      {source.processing_mode==='face' && source.processing_status==='running' && metrics[id]?.faces_detected===0 && <p className="text-amber-300">The detector is running but sees no face. Try a clearer frontal view, better lighting or move closer.</p>}
+      {source.processing_status==='error' && !source.last_error && <p className="text-red-400">Recognition worker stopped unexpectedly. Stop this source and reopen it.</p>}
+      {(source.last_error || metrics[id]?.last_error) && <p className="text-red-400">Pipeline error: {source.last_error || metrics[id]?.last_error}</p>}
+    </section>)}
+    {Object.keys(sources).length === 0 && <p className="card text-gray-400">Open your webcam or upload a video to start.</p>}
+  </div>
 }

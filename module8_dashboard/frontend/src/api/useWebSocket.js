@@ -1,87 +1,29 @@
-/**
- * useWebSocket.js — React hook for the IntelliGate live event WebSocket.
- *
- * Automatically connects, reconnects on drop, and exposes the latest
- * events array + system health to consuming components.
- *
- * Usage:
- *   const { events, health, connected } = useWebSocket()
- */
-
-import { useEffect, useRef, useState, useCallback } from 'react'
-
-const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
-const MAX_EVENTS = 200   // keep last 200 events in memory
+import { useEffect, useState } from 'react'
 
 export function useWebSocket() {
-  const [connected, setConnected]   = useState(false)
-  const [events,    setEvents]      = useState([])
-  const [alerts,    setAlerts]      = useState([])
-  const [health,    setHealth]      = useState(null)
-  const wsRef     = useRef(null)
-  const retryRef  = useRef(null)
-
-  const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
-
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
-
-    ws.onopen = () => {
-      setConnected(true)
-      clearInterval(retryRef.current)
-      // Start keep-alive ping every 20s
-      retryRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) ws.send('ping')
-      }, 20_000)
-    }
-
-    ws.onclose = () => {
-      setConnected(false)
-      clearInterval(retryRef.current)
-      // Reconnect after 3s
-      setTimeout(connect, 3_000)
-    }
-
-    ws.onerror = () => {
-      ws.close()
-    }
-
-    ws.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data)
-        handleMessage(msg)
-      } catch (_) {}
-    }
-  }, [])
-
-  function handleMessage(msg) {
-    const { type, timestamp, data } = msg
-
-    if (type === 'face_event' || type === 'vehicle_event') {
-      setEvents(prev => [
-        { ...data, type, timestamp, id: Date.now() + Math.random() },
-        ...prev.slice(0, MAX_EVENTS - 1),
-      ])
-    } else if (type === 'alert') {
-      setAlerts(prev => [
-        { ...data, timestamp, id: Date.now() + Math.random() },
-        ...prev.slice(0, 50),
-      ])
-    } else if (type === 'system') {
-      setHealth(data)
-    } else if (type === 'init') {
-      // Initial stats snapshot — ignore for now (pages fetch their own)
-    }
-  }
-
+  const [connected,setConnected]=useState(false)
+  const [events,setEvents]=useState([])
+  const [alerts,setAlerts]=useState([])
+  const [health,setHealth]=useState(null)
   useEffect(() => {
-    connect()
-    return () => {
-      clearInterval(retryRef.current)
-      wsRef.current?.close()
+    let disposed=false, socket, retry, ping
+    function connect() {
+      if(disposed) return
+      socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`)
+      socket.onopen=() => { setConnected(true); ping=setInterval(() => { if(socket.readyState===WebSocket.OPEN) socket.send('ping') },20000) }
+      socket.onclose=() => { clearInterval(ping); if(!disposed) { setConnected(false); retry=setTimeout(connect,3000) } }
+      socket.onerror=() => socket.close()
+      socket.onmessage=e => {
+        try {
+          const {type,data,timestamp}=JSON.parse(e.data)
+          if(['face_event','vehicle_event','event'].includes(type)) setEvents(prev=>[{...data,type,timestamp,id:data.event_id},...prev].slice(0,200))
+          if(type==='alert') setAlerts(prev=>[{...data,timestamp,id:data.alert_id},...prev].slice(0,50))
+          if(type==='system') setHealth(data)
+        } catch (_) { /* Ignore malformed messages without breaking reconnection. */ }
+      }
     }
-  }, [connect])
-
-  return { connected, events, alerts, health }
+    connect()
+    return () => { disposed=true; clearTimeout(retry); clearInterval(ping); socket?.close() }
+  },[])
+  return {connected,events,alerts,health}
 }

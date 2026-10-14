@@ -1,9 +1,16 @@
 import { useEffect, useState } from 'react'
 import { Car, Trash2, RefreshCw } from 'lucide-react'
-import { listVehicles, deleteVehicle } from '../api/client'
+import { listVehicles, deleteVehicle, request } from '../api/client'
 import clsx from 'clsx'
 
-export default function VehicleDatabase() {
+export default function VehicleDatabase({ user }) {
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  async function register(event) {
+    event.preventDefault(); setBusy(true); setError('')
+    try { await request('/vehicles/register', { method: 'POST', body: new FormData(event.target) }); event.target.reset(); load() }
+    catch (e) { setError(e.message) } finally { setBusy(false) }
+  }
   const [data,    setData]    = useState(null)
   const [loading, setLoading] = useState(false)
   const [search,  setSearch]  = useState('')
@@ -13,14 +20,14 @@ export default function VehicleDatabase() {
     setLoading(true)
     listVehicles()
       .then(setData)
-      .catch(() => setData({ count: 0, vehicles: {} }))
+      .catch(e => setError(e.message))
       .finally(() => setLoading(false))
   }
 
   useEffect(() => { load() }, [])
 
   const handleDelete = async (plate) => {
-    await deleteVehicle(plate).catch(() => {})
+    try { await deleteVehicle(plate) } catch(e) { setError(e.message); return }
     setConfirm(null)
     load()
   }
@@ -47,20 +54,14 @@ export default function VehicleDatabase() {
         </button>
       </div>
 
-      {/* Register tip */}
+      {error && <p role="alert" className="text-red-400">{error}</p>}
+      {user.role === 'admin' && <form onSubmit={register} className="card flex flex-wrap gap-3 items-end"><label>Plate<input className="input block" name="plate" required maxLength={20} /></label><label>Owner<input className="input block" name="owner" required maxLength={100} /></label><label>Cropped vehicle image (optional)<input className="input block" name="image" type="file" accept="image/*" /></label><button className="btn-primary" disabled={busy}>{busy ? 'Registering…' : 'Register vehicle'}</button></form>}
+      {/* Appearance matching is a review-only baseline. */}
       <div className="card bg-brand-600/10 border-brand-600/30">
-        <p className="text-sm text-brand-400 font-medium mb-1">Register a new vehicle</p>
+        <p className="text-sm text-brand-400 font-medium mb-1">CPU vehicle registry</p>
         <p className="text-xs text-gray-400 mb-2">
-          Run from your terminal inside the{' '}
-          <code className="font-mono bg-surface px-1 rounded">intelligate/</code> directory:
+          Register through the form above. Plate matching uses OCR; appearance candidates use a colour-histogram baseline and require review.
         </p>
-        <pre className="text-xs font-mono bg-surface rounded-lg p-3 text-green-400 overflow-x-auto">
-{`# With plate number only:
-python -m module2_vehicle.main --mode register --plate "ABC-1234" --owner "Hussain"
-
-# With image file:
-python -m module2_vehicle.main --mode register --plate "ABC-1234" --owner "Hussain" --image car.jpg`}
-        </pre>
       </div>
 
       {/* Search */}
@@ -141,7 +142,7 @@ python -m module2_vehicle.main --mode register --plate "ABC-1234" --owner "Hussa
                           </button>
                         </div>
                       ) : (
-                        <button
+                        <button disabled={user.role !== 'admin'}
                           onClick={() => setConfirm(plate)}
                           className="text-gray-600 hover:text-red-400 transition-colors"
                           title="Delete"

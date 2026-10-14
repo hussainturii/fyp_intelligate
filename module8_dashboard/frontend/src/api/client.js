@@ -5,10 +5,11 @@
 
 const BASE = '/api'
 
-async function request(path, options = {}) {
+export async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
     ...options,
+    credentials: 'same-origin',
+    headers: { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), ...options.headers },
   })
   if (!res.ok) {
     const err = await res.text()
@@ -54,10 +55,10 @@ export const listCameras  = () => request('/cameras')
 export const startCamera  = (id) => request(`/cameras/${id}/start`, { method: 'POST' })
 export const stopCamera   = (id) => request(`/cameras/${id}/stop`,  { method: 'POST' })
 
-export async function uploadVehicleVideo(id, file) {
+export async function uploadVehicleVideo(id, file, mode = 'vehicle') {
   const formData = new FormData()
   formData.append('video', file)
-  formData.append('mode', 'vehicle')
+  formData.append('mode', mode)
 
   const res = await fetch(`${BASE}/cameras/${id}/upload-video`, {
     method: 'POST',
@@ -72,9 +73,8 @@ export async function uploadVehicleVideo(id, file) {
   return res.json()
 }
 
-// MJPEG stream must bypass the Vite proxy — connect directly to FastAPI.
-// The Vite proxy buffers responses, which breaks multipart/x-mixed-replace streaming.
-const STREAM_BASE = 'http://localhost:8000/api'
+// Same-origin streaming keeps HttpOnly session authentication available.
+const STREAM_BASE = '/api'
 export const streamUrl = (id) => `${STREAM_BASE}/stream/${id}`
 
 // ── Health ────────────────────────────────────────────────────────────────

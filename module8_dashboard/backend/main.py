@@ -1,632 +1,707 @@
-"""
-main.py — IntelliGate Dashboard Backend
-========================================
-FastAPI application that serves the REST API and WebSocket endpoint
-for the IntelliGate Web Dashboard (Module 8).
-
-Endpoints:
-  GET  /api/stats                  — Dashboard overview counters
-  GET  /api/events                 — Paginated event log
-  POST /api/events                 — Log a new event (called by Modules 1 & 2)
-  GET  /api/alerts                 — List open/resolved alerts
-  POST /api/alerts                 — Create alert
-  PUT  /api/alerts/{id}/resolve    — Mark alert resolved
-  GET  /api/faces                  — List registered faces
-  POST /api/faces/register         — Register a new face (multipart)
-  DEL  /api/faces/{name}           — Delete a face profile
-  GET  /api/vehicles               — List registered vehicles
-  POST /api/vehicles/register      — Register a new vehicle
-  DEL  /api/vehicles/{plate}       — Delete a vehicle record
-  GET  /api/cameras                — List camera status
-  POST /api/cameras/{id}/start     — Start a camera stream
-  POST /api/cameras/{id}/stop      — Stop a camera stream
-  GET  /api/stream/{id}            — MJPEG live stream
-  GET  /api/health                 — System CPU/RAM/GPU health
-  WS   /ws                         — WebSocket for live push events
-
-Run with::
-
-    cd intelligate
-    uvicorn module8_dashboard.backend.main:app --reload --port 8000
-
-Author: Hussain Raza (SP23-BAI-057)
-"""
-
+"""CPU-only software dashboard: replay, policy, virtual devices and evidence."""
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import sys
+import threading
 import time
-import shutil
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Literal
 
+import cv2
+import numpy as np
 import psutil
 import yaml
-from fastapi import (
-    Body,
-    FastAPI,
-    HTTPException,
-    Query,
-    UploadFile,
-    WebSocket,
-    WebSocketDisconnect,
-    File,
-    Form,
-)
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# ── Project root on sys.path ──────────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parents[2]  # intelligate/
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+from .auth import Auth
+from .camera_manager import camera_manager
+from .event_store import EventStore
+from .software_runtime import SoftwareRuntime
+from .vision import FaceEngine, ReplayPipeline, INFERENCE_LOCK, appearance
+from .ws_manager import ws_manager
+from .test_workbench import TestWorkbench
 
-# ── Internal modules ──────────────────────────────────────────────────────────
-from module8_dashboard.backend.event_store  import EventStore
-from module8_dashboard.backend.ws_manager   import ws_manager, ConnectionManager
-from module8_dashboard.backend.camera_manager import camera_manager
-
-# ── Config ────────────────────────────────────────────────────────────────────
-_CONFIG_PATH = _ROOT / "config" / "config.yaml"
-with open(_CONFIG_PATH, encoding="utf-8") as f:
-    _CFG = yaml.safe_load(f)
-
-_DASHBOARD_CFG = _CFG.get("dashboard", {})
-_ALLOWED_ORIGINS = _DASHBOARD_CFG.get("cors_origins", ["http://localhost:5173", "http://localhost:3000"])
-_DB_PATH = _ROOT / _DASHBOARD_CFG.get("event_db", "logs/events.db")
-_UPLOAD_DIR = _ROOT / "logs" / "video_uploads"
-_CAM_IDX = _CFG.get("hardware", {}).get("camera_index", 0)
-_CAM_W   = _CFG.get("hardware", {}).get("camera_width",  1280)
-_CAM_H   = _CFG.get("hardware", {}).get("camera_height", 720)
-_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# ── Lazy imports for Module 1 & 2 databases ───────────────────────────────────
-def _get_face_db():
-    """Load face database lazily (Module 1)."""
-    try:
-        from module1_face_recognition.database.face_db import FaceDatabase
-        db_path = _ROOT / _CFG["face_recognition"]["database"]["path"]
-        return FaceDatabase(str(db_path))
-    except Exception as e:
-        logger.warning(f"[Dashboard] Cannot load FaceDatabase: {e}")
-        return None
-
-def _get_vehicle_db():
-    """Load vehicle database lazily (Module 2)."""
-    try:
-        from module2_vehicle.database.vehicle_db import VehicleDatabase
-        return VehicleDatabase()
-    except Exception as e:
-        logger.warning(f"[Dashboard] Cannot load VehicleDatabase: {e}")
-        return None
+ROOT = Path(__file__).resolve().parents[2]
+CFG = yaml.safe_load((ROOT / 'config/config.yaml').read_text(encoding='utf-8'))
+DB_PATH = Path(os.environ.get('IG_EVENT_DB', str(ROOT / 'logs/events.db')))
+UPLOAD_DIR = DB_PATH.parent / 'video_uploads'
+ORIGINS = CFG['dashboard']['cors_origins'] + ['http://127.0.0.1:5173', 'http://127.0.0.1:8000']
+event_store = runtime = auth = None
+face_engine = vehicle_db = None
+main_loop = None
+pipelines = {}
+workbench = None
+pipeline_lock = threading.RLock()
+SOURCE_MODES = Literal['raw', 'face', 'vehicle', 'scene', 'low_light', 'thermal']
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# App lifecycle & ML Integration
-# ─────────────────────────────────────────────────────────────────────────────
+def get_faces():
+    global face_engine
+    with INFERENCE_LOCK:
+        if face_engine is None:
+            face_engine = FaceEngine(event_store)
+    return face_engine
 
-event_store: EventStore
-main_loop: asyncio.AbstractEventLoop
-ml_pipeline_1 = None
-ml_pipeline_2 = None
 
-def on_pipeline_event(event_data: dict) -> None:
-    """Synchronous callback fired from ML threads when an event occurs."""
-    global event_store, main_loop
-    meta_str = json.dumps(event_data.get("meta")) if event_data.get("meta") else None
-    
-    # 1. Log to DB
-    eid = event_store.log_event(
-        module=event_data["module"],
-        event_type=event_data["event_type"],
-        identity=event_data["identity"],
-        confidence=event_data["confidence"],
-        method=event_data["method"],
-        camera_id=event_data.get("camera_id", 0),
-        meta=meta_str,
-    )
+def get_vehicles():
+    global vehicle_db
+    with INFERENCE_LOCK:
+        if vehicle_db is None:
+            from module2_vehicle.database.vehicle_db import VehicleDatabase
+            vehicle_db = VehicleDatabase(str(DB_PATH.parent / 'cpu_vehicles.h5'), str(DB_PATH.parent / 'cpu_unknown_vehicles.h5'))
+    return vehicle_db
 
-    # 2. Broadcast via WS
-    ws_type = "face_event" if event_data["module"] == "face" else "vehicle_event"
-    payload = {
-        "event_id":   eid,
-        "event_type": event_data["event_type"],
-        "identity":   event_data["identity"],
-        "confidence": event_data["confidence"],
-        "method":     event_data["method"],
-        "camera_id":  event_data.get("camera_id", 0),
-    }
-    
+
+def on_pipeline_event(event):
+    result = runtime.observe(event) if event['module'] in {'face', 'vehicle'} else {
+        'event_id': runtime.emit(event['module'], event['event_type'], event.get('identity'), **(event.get('meta') or {}))}
+    if event['module'] in {'queue', 'visitors'} and event['event_type'] in {'congestion', 'loitering'}:
+        event_store.log_alert('MEDIUM', event['event_type'], event['event_type'].replace('_', ' ').title(), event_id=result['event_id'])
+    payload = {**event, **result}
     if main_loop and main_loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            ws_manager.broadcast_event(ws_type, payload),
-            main_loop
-        )
-        logger.info(f"[EventCallback] Received: {event_data.get('event_type')} | Identity: {event_data.get('identity')} | event_store={'OK' if event_store else 'NONE'} | main_loop={'OK' if main_loop else 'NONE'}")
+        asyncio.run_coroutine_threadsafe(ws_manager.broadcast_event('face_event' if event['module'] == 'face' else 'vehicle_event' if event['module'] == 'vehicle' else 'event', payload), main_loop)
+
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Start camera and health-tick background task on startup."""
-    global event_store, main_loop
+async def lifespan(app):
+    global event_store, runtime, auth, main_loop, face_engine, vehicle_db, workbench
+    event_store = EventStore(str(DB_PATH))
+    runtime, auth = SoftwareRuntime(event_store), Auth(event_store)
+    workbench = TestWorkbench(ROOT,DB_PATH)
     main_loop = asyncio.get_running_loop()
-    event_store = EventStore(str(_DB_PATH))
-
-    # Start default camera
-    ok = camera_manager.add_camera(_CAM_IDX, _CAM_W, _CAM_H)
-    if not ok:
-        logger.warning("[Dashboard] Default camera not available — stream will be offline")
-    else:
-        try:
-            global ml_pipeline_1
-            from module1_face_recognition.main import IntelliGateModule1
-            ml_pipeline_1 = IntelliGateModule1(on_event_callback=on_pipeline_event)
-            camera_manager.set_pipeline(_CAM_IDX, ml_pipeline_1.process_frame)
-            logger.info("[Dashboard] Face module loaded as default pipeline.")
-        except Exception as e:
-            logger.error(f"[Dashboard] Failed to load default Face module: {e}")
-
-    # Background system health broadcaster
-    health_task = asyncio.create_task(_health_broadcast_loop())
-
-    logger.success("[Dashboard] IntelliGate Dashboard backend running")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    task = asyncio.create_task(background())
     yield
-
-    # Cleanup
-    health_task.cancel()
-    camera_manager.stop_all()
-    logger.info("[Dashboard] Backend shutdown")
-
-
-async def _health_broadcast_loop() -> None:
-    """Broadcast CPU/RAM stats to WebSocket clients every 5 seconds."""
-    while True:
-        try:
-            payload = _get_health_payload()
-            event_store.log_health(
-                cpu_pct=payload["cpu"],
-                mem_pct=payload["memory"],
-                gpu_pct=payload.get("gpu", 0),
-                fps=payload.get("fps", 0),
-                cam_online=payload.get("camera_online", False),
-            )
-            await ws_manager.broadcast_event("system", payload)
-        except Exception as e:
-            logger.debug(f"[Health] broadcast error: {e}")
-        await asyncio.sleep(5)
-
-
-def _get_health_payload() -> Dict[str, Any]:
-    cpu = psutil.cpu_percent(interval=None)
-    mem = psutil.virtual_memory().percent
-    gpu = 0.0
+    task.cancel()
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-        util   = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        gpu    = float(util.gpu)
-    except Exception:
+        await task
+    except asyncio.CancelledError:
         pass
-
-    cam_list = camera_manager.list_cameras()
-    cam_online = bool(cam_list)
-    fps = cam_list.get(_CAM_IDX, {}).get("fps", 0.0) if cam_list else 0.0
-
-    return {
-        "cpu":           round(cpu, 1),
-        "memory":        round(mem, 1),
-        "gpu":           round(gpu, 1),
-        "fps":           round(fps, 1),
-        "camera_online": cam_online,
-    }
+    await asyncio.to_thread(camera_manager.stop_all)
+    pipelines.clear()
+    face_engine = vehicle_db = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI App
-# ─────────────────────────────────────────────────────────────────────────────
+async def background():
+    last_broadcast = 0
+    last_report = None
+    with event_store._conn() as db:
+        last_alert_id = db.execute('SELECT COALESCE(MAX(id),0) FROM alerts').fetchone()[0]
+    while True:
+        await asyncio.to_thread(runtime.tick)
+        with event_store._conn() as db:
+            new_alerts = db.execute('SELECT * FROM alerts WHERE id>? ORDER BY id LIMIT 200', (last_alert_id,)).fetchall()
+        for row in new_alerts:
+            await ws_manager.broadcast_event('alert', {**dict(row), 'alert_id': row['id']})
+            last_alert_id = row['id']
+        now = time.time()
+        day = time.strftime('%Y-%m-%d', time.gmtime(now))
+        if last_report != day:
+            runtime.save('latest_report', runtime.report())
+            last_report = day
+        if now - last_broadcast >= 5:
+            payload = health()
+            event_store.log_health(payload['cpu'], payload['memory'], fps=payload['fps'], cam_online=payload['camera_online'])
+            await ws_manager.broadcast_event('system', payload)
+            await ws_manager.broadcast_event('gate', runtime.gate())
+            last_broadcast = now
+        await asyncio.sleep(0.1)
 
-app = FastAPI(
-    title="IntelliGate Dashboard API",
-    version="1.0",
-    description="REST + WebSocket backend for the IntelliGate Security Dashboard",
-    lifespan=lifespan,
-)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],           # Allow all origins so the MJPEG <img> tag works
-    allow_credentials=False,       # Must be False when allow_origins=["*"]
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title='IntelliGate software prototype', version='2.0', lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pydantic Models
-# ─────────────────────────────────────────────────────────────────────────────
+@app.middleware('http')
+async def authorization(request: Request, call_next):
+    path = request.url.path
+    if path.startswith('/api/'):
+        if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+            origin = request.headers.get('origin')
+            if origin and origin not in ORIGINS:
+                return JSONResponse({'detail': 'Origin is not allowed'}, status_code=403)
+        if path not in {'/api/auth/status', '/api/auth/setup', '/api/auth/login'} and request.method != 'OPTIONS':
+            user = auth.user(request.cookies.get('ig_session')) if auth else None
+            if not user:
+                return JSONResponse({'detail': 'Sign in required'}, status_code=401)
+            request.state.user = user
+            if request.method not in {'GET', 'HEAD'}:
+                admin_only = '/register' in path or path == '/api/auth/users' or request.method == 'DELETE'
+                if (admin_only and user['role'] != 'admin') or (user['role'] == 'viewer' and path != '/api/auth/logout'):
+                    return JSONResponse({'detail': 'Your role cannot perform this action'}, status_code=403)
+    return await call_next(request)
+
+
+class Credentials(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserIn(Credentials):
+    role: Literal['admin', 'security_staff', 'viewer']
+
+
+@app.get('/api/auth/status')
+def auth_status(request: Request):
+    return {'setup_required': not auth.ready(), 'user': auth.user(request.cookies.get('ig_session'))}
+
+
+@app.post('/api/auth/setup')
+def setup(body: Credentials, request: Request):
+    if request.client.host not in {'127.0.0.1', '::1', 'localhost', 'testclient'}:
+        raise HTTPException(403, 'Initial setup is local-only')
+    return auth.create(body.username, body.password, 'admin', bootstrap=True)
+
+
+@app.post('/api/auth/login')
+def login(body: Credentials, request: Request, response: Response):
+    token = auth.login(body.username, body.password, request.client.host)
+    response.set_cookie('ig_session', token, httponly=True, samesite='strict', secure=request.url.scheme == 'https', max_age=8*3600)
+    return {'user': auth.user(token)}
+
+
+@app.post('/api/auth/logout')
+def logout(request: Request, response: Response):
+    auth.logout(request.cookies.get('ig_session'))
+    response.delete_cookie('ig_session')
+    return {'status': 'signed_out'}
+
+
+@app.post('/api/auth/users')
+def add_user(body: UserIn):
+    return auth.create(body.username, body.password, body.role)
+
+
+@app.get('/api/stats')
+def stats():
+    result = event_store.get_stats()
+    with event_store._conn() as db:
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE name='cpu_faces'").fetchone()
+        result['registered_faces'] = db.execute('SELECT COUNT(*) FROM cpu_faces').fetchone()[0] if table else 0
+    result['registered_vehicles'] = len(get_vehicles()._vehicles)
+    return result
+
 
 class EventIn(BaseModel):
-    module:     str
-    event_type: str
-    identity:   Optional[str]  = None
-    confidence: Optional[float] = None
-    method:     Optional[str]  = None
-    camera_id:  int            = 0
-    meta:       Optional[Dict] = None
+    module: Literal['face', 'vehicle', 'queue', 'safety', 'visitors']
+    event_type: str = Field(min_length=1, max_length=64)
+    identity: str | None = Field(None, max_length=128)
+    confidence: float | None = Field(None, ge=0, le=1)
+    method: str | None = None
+    camera_id: int = Field(0, ge=0)
+    meta: dict = Field(default_factory=dict)
+
+
+@app.get('/api/events')
+def events(module: str | None = None, event_type: str | None = None, since_hours: int | None = Query(None, ge=1, le=8760), limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)):
+    return event_store.get_events(module, event_type, since_hours, limit, offset)
+
+
+@app.post('/api/events')
+async def add_event(body: EventIn):
+    # External/test events cannot self-assert validated biometric access.
+    event = body.model_dump()
+    event['meta']['validated_liveness'] = False
+    event['meta']['ocr_confidence'] = 0
+    result = runtime.observe(event)
+    await ws_manager.broadcast_event('event', {**event, **result})
+    return result
+
+
+@app.get('/api/alerts')
+def alerts(resolved: bool | None = False, limit: int = Query(50, ge=1, le=200)):
+    return event_store.get_alerts(resolved, limit)
 
 
 class AlertIn(BaseModel):
-    severity:    str
-    category:    str
-    title:       str
-    description: Optional[str] = None
-    event_id:    Optional[int] = None
-
-class CameraModeIn(BaseModel):
-    mode: str          # "face", "vehicle", "raw"
-    video_path: Optional[str] = None
+    severity: Literal['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+    category: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(None, max_length=2000)
+    event_id: int | None = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Stats ────────────────────────────────────────────────────────────────────
+@app.post('/api/alerts')
+async def add_alert(body: AlertIn):
+    if body.event_id is not None:
+        with event_store._conn() as db:
+            if not db.execute('SELECT 1 FROM events WHERE id=?', (body.event_id,)).fetchone():
+                raise HTTPException(422, 'Evidence event not found')
+    identity = event_store.log_alert(**body.model_dump())
+    await ws_manager.broadcast_event('alert', {'alert_id': identity, **body.model_dump()})
+    return {'status': 'created', 'alert_id': identity}
 
-@app.get("/api/stats")
-async def get_stats() -> Dict[str, Any]:
-    """Overview counters for the dashboard home page."""
-    stats = event_store.get_stats()
 
-    # Include total registered counts so cards are non-zero even before gate events
+@app.put('/api/alerts/{alert_id}/resolve')
+def resolve_alert(alert_id: int):
+    if not event_store.resolve_alert(alert_id):
+        raise HTTPException(404, 'Alert not found')
+    return {'status': 'resolved', 'alert_id': alert_id}
+
+
+@app.get('/api/faces')
+def list_faces():
     try:
-        vdb = _get_vehicle_db()
-        stats["registered_vehicles"] = len(vdb._vehicles) if vdb else 0
-    except Exception:
-        stats["registered_vehicles"] = 0
+        persons = get_faces().list()
+        return {'count': len(persons), 'persons': persons}
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc))
 
+
+async def image_upload(file):
+    content = await file.read(10*1024*1024 + 1)
+    if len(content) > 10*1024*1024:
+        raise HTTPException(413, 'Image limit is 10 MB')
+    frame = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise HTTPException(422, 'File is not a readable image')
+    if max(frame.shape[:2]) > 1600:
+        scale = 1600 / max(frame.shape[:2])
+        frame = cv2.resize(frame, None, fx=scale, fy=scale)
+    return frame
+
+
+@app.post('/api/faces/register')
+async def register_face(request: Request, name: str = Form(..., min_length=1, max_length=100), role: str = Form('resident'), image: UploadFile = File(...)):
+    frame = await image_upload(image)
     try:
-        fdb = _get_face_db()
-        persons = fdb.list_persons() if fdb and hasattr(fdb, "list_persons") else {}
-        stats["registered_faces"] = len(persons)
-    except Exception:
-        stats["registered_faces"] = 0
-
-    return stats
+        identity = await asyncio.to_thread(get_faces().register, name.strip(), role, frame)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(422, str(exc))
+    runtime.emit('identity', 'face_registered', name, actor=request.state.user['username'])
+    return {'status': 'registered', 'user_id': identity, 'model': 'SFace CPU'}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Events ───────────────────────────────────────────────────────────────────
-
-@app.get("/api/events")
-async def get_events(
-    module:      Optional[str] = Query(None),
-    event_type:  Optional[str] = Query(None),
-    since_hours: Optional[int] = Query(None),
-    limit:       int           = Query(100, ge=1, le=500),
-    offset:      int           = Query(0, ge=0),
-) -> List[Dict]:
-    return event_store.get_events(
-        module=module,
-        event_type=event_type,
-        since_hours=since_hours,
-        limit=limit,
-        offset=offset,
-    )
+@app.delete('/api/faces/{name}')
+def delete_face(name: str):
+    with INFERENCE_LOCK:
+        if not get_faces().delete(name):
+            raise HTTPException(404, 'Person not found')
+    runtime.emit('identity', 'face_removed', name)
+    return {'status': 'deleted'}
 
 
-@app.post("/api/events")
-async def log_event(event: EventIn) -> Dict[str, Any]:
-    """
-    Called by Module 1 / Module 2 pipelines to log a recognition event
-    and push it to connected dashboard clients via WebSocket.
-    """
-    meta_str = json.dumps(event.meta) if event.meta else None
-    eid = event_store.log_event(
-        module=event.module,
-        event_type=event.event_type,
-        identity=event.identity,
-        confidence=event.confidence,
-        method=event.method,
-        camera_id=event.camera_id,
-        meta=meta_str,
-    )
-
-    # Push to WebSocket clients
-    ws_type = "face_event" if event.module == "face" else "vehicle_event"
-    await ws_manager.broadcast_event(ws_type, {
-        "event_id":   eid,
-        "event_type": event.event_type,
-        "identity":   event.identity,
-        "confidence": event.confidence,
-        "method":     event.method,
-        "camera_id":  event.camera_id,
-    })
-
-    return {"event_id": eid, "status": "logged"}
+@app.get('/api/vehicles')
+def list_vehicles():
+    with INFERENCE_LOCK:
+        vehicles = get_vehicles().list_vehicles_dict()
+    return {'count': len(vehicles), 'vehicles': vehicles}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Alerts ───────────────────────────────────────────────────────────────────
-
-@app.get("/api/alerts")
-async def get_alerts(
-    resolved: Optional[bool] = Query(False),
-    limit:    int             = Query(50, ge=1, le=200),
-) -> List[Dict]:
-    return event_store.get_alerts(resolved=resolved, limit=limit)
-
-
-@app.post("/api/alerts")
-async def create_alert(alert: AlertIn) -> Dict[str, Any]:
-    aid = event_store.log_alert(
-        severity=alert.severity,
-        category=alert.category,
-        title=alert.title,
-        description=alert.description,
-        event_id=alert.event_id,
-    )
-    await ws_manager.broadcast_event("alert", {
-        "alert_id":    aid,
-        "severity":    alert.severity,
-        "category":    alert.category,
-        "title":       alert.title,
-        "description": alert.description,
-    })
-    return {"alert_id": aid, "status": "created"}
+@app.post('/api/vehicles/register')
+async def register_vehicle(request: Request, plate: str = Form(..., min_length=1, max_length=20), owner: str = Form(..., min_length=1, max_length=100), image: UploadFile | None = File(None)):
+    frame = await image_upload(image) if image and image.filename else None
+    plate = ''.join(c for c in plate.upper() if c.isalnum())
+    if not plate:
+        raise HTTPException(422, 'Plate must contain letters or digits')
+    with INFERENCE_LOCK:
+        db = get_vehicles()
+        if plate in db._plate_map:
+            raise HTTPException(409, 'Plate already registered')
+        vid = db.register(plate, owner.strip(), embedding=appearance(frame) if frame is not None else None,
+                          notes='CPU colour histogram baseline; upload a cropped vehicle image')
+        for pipeline in pipelines.values():
+            pipeline.invalidate_vehicle_gallery()
+    runtime.emit('identity', 'vehicle_registered', plate, actor=request.state.user['username'])
+    return {'status': 'registered', 'vehicle_id': vid}
 
 
-@app.put("/api/alerts/{alert_id}/resolve")
-async def resolve_alert(alert_id: int) -> Dict[str, Any]:
-    event_store.resolve_alert(alert_id)
-    return {"alert_id": alert_id, "status": "resolved"}
+@app.delete('/api/vehicles/{plate}')
+def delete_vehicle(plate: str):
+    with INFERENCE_LOCK:
+        if not get_vehicles().delete_vehicle(plate):
+            raise HTTPException(404, 'Vehicle not found')
+        for pipeline in pipelines.values():
+            pipeline.invalidate_vehicle_gallery()
+    runtime.emit('identity', 'vehicle_removed', plate)
+    return {'status': 'deleted'}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Face Database ─────────────────────────────────────────────────────────────
+def configure_source(source_id, mode, path=None):
+    with pipeline_lock:
+        # Single active inference source is deliberate on this 8 GB CPU host.
+        previous_sources = list(pipelines)
+        camera_manager.stop_all()
+        for previous in previous_sources:
+            runtime.obstruction(False, f'replay-{previous}')
+        pipelines.clear()
+        pipeline = ReplayPipeline(mode, runtime, on_pipeline_event, get_faces() if mode == 'face' else None,
+                                  get_vehicles() if mode == 'vehicle' else None,
+                                  runtime.load('scene_config', {}))
+        pipeline.source_id = source_id
+        pipeline.replayed = path is not None
+        if not camera_manager.add_camera(source_id, 960, 540, video_path=str(path) if path else None, pipeline_func=pipeline.process_frame):
+            raise ValueError('Cannot open camera/video: check camera index, Windows permissions and other camera apps')
+        pipelines[source_id] = pipeline
+        label = Path(path).name if path else f'Camera {source_id}'
+        runtime.emit('sources', 'replay_started' if path else 'camera_started', label, mode=mode, source_id=source_id)
+        return {'cam_id': source_id, 'mode': mode, 'status': 'updated', 'replayed': path is not None, 'filename': label}
 
-@app.get("/api/faces")
-async def list_faces() -> Dict[str, Any]:
-    """List all registered persons in the face database."""
-    db = _get_face_db()
-    if db is None:
-        raise HTTPException(503, "Face database unavailable")
+
+@app.post('/api/cameras/{cam_id}/upload-video')
+async def upload_video(cam_id: int, video: UploadFile = File(...), mode: SOURCE_MODES = Form('raw')):
+    if not 0 <= cam_id <= 7:
+        raise HTTPException(422, 'Source index must be 0-7')
+    suffix = Path(video.filename or '').suffix.lower()
+    if suffix not in {'.mp4', '.avi', '.mov', '.mkv', '.webm'}:
+        raise HTTPException(422, 'Upload MP4, AVI, MOV, MKV or WebM')
+    path = UPLOAD_DIR / f'{uuid.uuid4()}{suffix}'
+    size = 0
     try:
-        # FaceDatabase.list_persons() returns dict of name → metadata
-        persons = db.list_persons() if hasattr(db, "list_persons") else {}
-        return {"count": len(persons), "persons": persons}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        with path.open('wb') as dest:
+            while chunk := await video.read(1024*1024):
+                size += len(chunk)
+                if size > 250*1024*1024:
+                    raise HTTPException(413, 'Video limit is 250 MB')
+                dest.write(chunk)
+        return await asyncio.to_thread(configure_source, cam_id, mode, path)
+    except HTTPException:
+        path.unlink(missing_ok=True)
+        raise
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, f'Pipeline unavailable: {exc}')
 
 
-@app.delete("/api/faces/{name}")
-async def delete_face(name: str) -> Dict[str, Any]:
-    db = _get_face_db()
-    if db is None:
-        raise HTTPException(503, "Face database unavailable")
-    try:
-        if hasattr(db, "delete_person"):
-            db.delete_person(name)
-        return {"name": name, "status": "deleted"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Vehicle Database ──────────────────────────────────────────────────────────
-
-@app.get("/api/vehicles")
-async def list_vehicles() -> Dict[str, Any]:
-    """List all registered vehicles."""
-    db = _get_vehicle_db()
-    if db is None:
-        raise HTTPException(503, "Vehicle database unavailable")
-    try:
-        vehicles = (db.list_vehicles_dict() if hasattr(db, "list_vehicles_dict")
-                    else {})
-        return {"count": len(vehicles), "vehicles": vehicles}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.delete("/api/vehicles/{plate}")
-async def delete_vehicle(plate: str) -> Dict[str, Any]:
-    db = _get_vehicle_db()
-    if db is None:
-        raise HTTPException(503, "Vehicle database unavailable")
-    try:
-        if hasattr(db, "delete_vehicle"):
-            db.delete_vehicle(plate)
-        return {"plate": plate, "status": "deleted"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Cameras ───────────────────────────────────────────────────────────────────
-
-@app.get("/api/cameras")
-async def list_cameras() -> Dict[str, Any]:
+@app.get('/api/cameras')
+def list_cameras():
     return camera_manager.list_cameras()
 
 
-@app.post("/api/cameras/{cam_id}/start")
-async def start_camera(cam_id: int) -> Dict[str, Any]:
-    ok = camera_manager.add_camera(cam_id, _CAM_W, _CAM_H)
-    if not ok:
-        raise HTTPException(503, f"Cannot open camera {cam_id}")
-    return {"cam_id": cam_id, "status": "started"}
+DEMO_SOURCES = {
+    'local_vehicle': (ROOT.parent / 'nre/video test.mp4', 'Local vehicle clip (unannotated)'),
+    'llvip_visible': (ROOT / 'logs/demo_data/llvip_visible.mp4', 'LLVIP visible illustration (unannotated)'),
+    'llvip_infrared': (ROOT / 'logs/demo_data/llvip_infrared.mp4', 'LLVIP genuine infrared illustration (unannotated)'),
+    'face_smoke': (ROOT / 'logs/demo_data/face_smoke.mp4', 'Static OpenCV face smoke test (not liveness data)'),
+}
 
 
-@app.post("/api/cameras/{cam_id}/stop")
-async def stop_camera(cam_id: int) -> Dict[str, Any]:
-    camera_manager.remove_camera(cam_id)
-    return {"cam_id": cam_id, "status": "stopped"}
+@app.get('/api/demo/sources')
+def demo_sources():
+    return [{'id': key, 'label': label} for key, (path, label) in DEMO_SOURCES.items() if path.exists()]
 
 
-@app.post("/api/cameras/{cam_id}/mode")
-async def set_camera_mode(cam_id: int, config: CameraModeIn) -> Dict[str, Any]:
-    """Switch camera mode and lazy-load the appropriate ML pipeline."""
-    global ml_pipeline_1, ml_pipeline_2
-    
-    # 1. Re-initialize camera stream if video_path changed
-    camera_manager.remove_camera(cam_id)
-    ok = camera_manager.add_camera(cam_id, _CAM_W, _CAM_H, video_path=config.video_path)
-    if not ok:
-        raise HTTPException(503, f"Cannot open camera/video source for {cam_id}")
-
-    # 2. Set the pipeline
-    if config.mode == "face":
-        # Free up memory for vehicle module
-        ml_pipeline_2 = None 
-        import gc
-        gc.collect()
-        
-        # Lazy load Module 1
-        if ml_pipeline_1 is None:
-            from module1_face_recognition.main import IntelliGateModule1
-            ml_pipeline_1 = IntelliGateModule1(on_event_callback=on_pipeline_event)
-        camera_manager.set_pipeline(cam_id, ml_pipeline_1.process_frame)
-        
-    elif config.mode == "vehicle":
-        # Free up memory for face module
-        ml_pipeline_1 = None
-        import gc
-        gc.collect()
-        
-        # Lazy load Module 2
-        if ml_pipeline_2 is None:
-            from module2_vehicle.main import IntelliGateModule2
-            ml_pipeline_2 = IntelliGateModule2(on_event_callback=on_pipeline_event)
-        camera_manager.set_pipeline(cam_id, ml_pipeline_2.process_frame)
-        
-    else: # "raw"
-        ml_pipeline_1 = None
-        ml_pipeline_2 = None
-        import gc
-        gc.collect()
-        camera_manager.set_pipeline(cam_id, None)
-
-    return {"cam_id": cam_id, "mode": config.mode, "status": "updated"}
+class DemoIn(BaseModel):
+    source: Literal['local_vehicle', 'llvip_visible', 'llvip_infrared', 'face_smoke']
+    mode: SOURCE_MODES = 'raw'
 
 
-@app.post("/api/cameras/{cam_id}/upload-video")
-async def upload_camera_video(
-    cam_id: int,
-    video: UploadFile = File(...),
-    mode: str = Form("vehicle"),
-) -> Dict[str, Any]:
-    """Upload a local video file, save it on the server, and route the camera stream through it."""
-    global ml_pipeline_1, ml_pipeline_2
-
-    if mode != "vehicle":
-        raise HTTPException(400, "Only vehicle mode is supported for uploaded videos")
-
-    suffix = Path(video.filename or "uploaded_video.mp4").suffix or ".mp4"
-    safe_name = f"cam_{cam_id}_{int(time.time())}{suffix}"
-    saved_path = _UPLOAD_DIR / safe_name
-
-    with saved_path.open("wb") as f:
-        shutil.copyfileobj(video.file, f)
-
-    camera_manager.remove_camera(cam_id)
-    ok = camera_manager.add_camera(cam_id, _CAM_W, _CAM_H, video_path=str(saved_path))
-    if not ok:
-        raise HTTPException(503, f"Cannot open uploaded video for {cam_id}")
-
-    ml_pipeline_1 = None
-    import gc
-    gc.collect()
-
-    if ml_pipeline_2 is None:
-        from module2_vehicle.main import IntelliGateModule2
-        ml_pipeline_2 = IntelliGateModule2(on_event_callback=on_pipeline_event)
-    camera_manager.set_pipeline(cam_id, ml_pipeline_2.process_frame)
-
-    return {
-        "cam_id": cam_id,
-        "mode": "vehicle",
-        "status": "updated",
-        "video_path": str(saved_path),
-        "filename": video.filename,
-    }
+@app.post('/api/demo/replay')
+async def demo_replay(body: DemoIn):
+    if body.source.startswith('llvip') and body.mode in {'face', 'vehicle'}:
+        raise HTTPException(422, 'LLVIP inputs are for scene/low-light detection only, not identity recognition')
+    path, _ = DEMO_SOURCES[body.source]
+    if not path.exists():
+        raise HTTPException(404, 'Run python tools/prepare_demo_data.py first')
+    try:
+        return await asyncio.to_thread(configure_source, 0, body.mode, path)
+    except Exception as exc:
+        raise HTTPException(422, str(exc))
 
 
-@app.get("/api/stream/{cam_id}")
-async def video_stream(cam_id: int):
-    """
-    MJPEG live video stream.
-    Open in an <img> tag: <img src="http://localhost:8000/api/stream/0" />
-    """
+@app.post('/api/cameras/{cam_id}/start')
+async def start_source(cam_id: int, mode: SOURCE_MODES = Query('face')):
+    if not 0 <= cam_id <= 7:
+        raise HTTPException(422,'Camera index must be 0-7')
+    if mode == 'thermal':
+        raise HTTPException(422,'Use genuine infrared recordings for thermal mode')
+    try:
+        return await asyncio.to_thread(configure_source,cam_id,mode)
+    except Exception as exc:
+        raise HTTPException(422,str(exc))
+
+
+class CameraEnrolment(BaseModel):
+    name: str = Field(min_length=1,max_length=100)
+    role: Literal['resident','employee','security_staff'] = 'resident'
+    camera_id: int = Field(0,ge=0,le=7)
+
+
+@app.post('/api/faces/register-camera')
+async def register_camera_face(body: CameraEnrolment, request: Request):
+    snapshot = camera_manager.get_snapshot(body.camera_id)
+    if snapshot is None:
+        raise HTTPException(422,'Open a camera/source first and wait for a clear frame')
+    try:
+        identity = await asyncio.to_thread(get_faces().register,body.name.strip(),body.role,snapshot)
+    except (ValueError,RuntimeError) as exc:
+        raise HTTPException(422,str(exc))
+    runtime.emit('identity','face_registered',body.name,actor=request.state.user['username'])
+    return {'status':'registered','user_id':identity,'model':'SFace CPU'}
+
+
+@app.post('/api/cameras/{cam_id}/stop')
+async def stop_source(cam_id: int):
+    await asyncio.to_thread(camera_manager.remove_camera, cam_id)
+    runtime.obstruction(False, f'replay-{cam_id}')
+    pipelines.pop(cam_id, None)
+    return {'status': 'stopped'}
+
+
+@app.get('/api/stream/{cam_id}')
+def stream(cam_id: int):
     if cam_id not in camera_manager._cameras:
-        ok = camera_manager.add_camera(cam_id, _CAM_W, _CAM_H)
-        if not ok:
-            raise HTTPException(503, f"Camera {cam_id} unavailable")
-
-    return StreamingResponse(
-        camera_manager.mjpeg_generator(cam_id),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+        raise HTTPException(404, 'Upload a video first')
+    return StreamingResponse(camera_manager.mjpeg_generator(cam_id), media_type='multipart/x-mixed-replace; boundary=frame')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Health ────────────────────────────────────────────────────────────────────
-
-@app.get("/api/health")
-async def get_health() -> Dict[str, Any]:
-    return {
-        **_get_health_payload(),
-        "history": event_store.get_recent_health(60),
-    }
+class GateCommand(BaseModel):
+    command: Literal['OPEN', 'CLOSE', 'STOP', 'LOCKDOWN', 'RESET']
+    command_id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=100)
+    expires: float | None = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+@app.get('/api/gate')
+def gate():
+    return runtime.tick()
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time event push.
 
-    On connect, sends a snapshot of current stats.
-    Stays open indefinitely — clients receive events as they happen.
-    """
+@app.post('/api/gate/command')
+async def gate_command(body: GateCommand, request: Request):
+    try:
+        result = runtime.command(body.command, request.state.user['username'], body.command_id, body.expires)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    await ws_manager.broadcast_event('gate', result)
+    return result
+
+
+class ObstructionIn(BaseModel):
+    present: bool
+
+
+@app.post('/api/gate/obstruction')
+def obstruction(body: ObstructionIn):
+    return runtime.obstruction(body.present)
+
+
+@app.get('/api/reviews')
+def reviews():
+    return runtime.reviews()
+
+
+class ReviewIn(BaseModel):
+    approve: bool
+
+
+@app.post('/api/reviews/{request_id}')
+def review(request_id: str, body: ReviewIn, request: Request):
+    try:
+        return runtime.review(request_id, body.approve, request.state.user['username'])
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+@app.get('/api/visitors')
+def visitors():
+    return runtime.visitors()
+
+
+@app.get('/api/reports')
+def reports(hours: int = Query(24, ge=1, le=8760)):
+    return runtime.report(hours)
+
+
+@app.get('/api/search')
+def search(q: str = Query(..., min_length=1, max_length=200)):
+    try:
+        return runtime.search(q)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+
+class SceneConfig(BaseModel):
+    queue_roi: list[float] = Field(default=[0,0,1,1], min_length=4, max_length=4)
+    gate_roi: list[float] = Field(default=[0.4,0.65,0.6,1], min_length=4, max_length=4)
+    queue_threshold: int = Field(5, ge=1, le=100)
+    loiter_seconds: int = Field(30, ge=1, le=3600)
+
+
+@app.post('/api/scene/config')
+def scene_config(body: SceneConfig):
+    for roi in [body.queue_roi, body.gate_roi]:
+        if not all(0 <= v <= 1 for v in roi) or not roi[0] < roi[2] or not roi[1] < roi[3]:
+            raise HTTPException(422, 'ROIs require normalized x1,y1,x2,y2 with positive area')
+    runtime.save('scene_config', body.model_dump())
+    for pipeline in list(pipelines.values()):
+        pipeline.config = body.model_dump()
+    return body.model_dump()
+
+
+@app.get('/api/modules')
+def modules():
+    return {'simulated': True, 'device': 'cpu', 'modules': [
+        {'id': 1, 'name': 'Face recognition', 'status': 'Live/replay multi-face tracking; cached SFace identities; liveness unvalidated; review required'},
+        {'id': 2, 'name': 'Vehicles', 'status': 'YOLO vehicles / EasyOCR; OpenCV contour plate fallback; colour histogram appearance baseline'},
+        {'id': 3, 'name': 'Night / infrared', 'status': 'CLAHE RGB enhancement; genuine infrared input required; benchmark pending'},
+        {'id': 4, 'name': 'Stranger memory', 'status': 'Encrypted face candidates; distinct session visits; rule-based dwell'},
+        {'id': 5, 'name': 'Queue / density', 'status': 'ROI counts and IoU tracking baseline'},
+        {'id': 6, 'name': 'Safety', 'status': 'ROI obstruction, virtual STOP and operator lockdown'},
+        {'id': 7, 'name': 'Reporting', 'status': 'Evidence templates and keyword search; VLM/SSM deferred'},
+        {'id': 8, 'name': 'Dashboard', 'status': 'Live webcam/replay, enrolment, approvals, alerts and reports'},
+        {'id': 9, 'name': 'Devices', 'status': 'Virtual gate only; physical hardware excluded'},
+        {'id': 10, 'name': 'Backend', 'status': 'Cookie authentication, roles, SQLite/HDF5 persistence'},
+    ], 'scene': runtime.load('scene', {}), 'scene_config': runtime.load('scene_config', SceneConfig().model_dump()),
+       'pipelines': {key: value.metrics for key, value in pipelines.items()}}
+
+
+@app.post('/api/testing/checks',status_code=202)
+def testing_checks():
+    try:
+        return {'id':workbench.checks()}
+    except ValueError as exc:
+        raise HTTPException(409,str(exc))
+
+
+class CameraTestIn(BaseModel):
+    camera_id:int=Field(0,ge=0,le=7)
+    expected_identity:str|None=Field(None,max_length=100)
+    expected_count:int|None=Field(None,ge=0,le=100)
+
+
+@app.post('/api/testing/camera',status_code=202)
+def testing_camera(body:CameraTestIn):
+    frame=camera_manager.get_snapshot(body.camera_id)
+    if frame is None:
+        raise HTTPException(422,'Open a camera/source first and wait for a frame')
+    ok,encoded=cv2.imencode('.png',frame)
+    if not ok:
+        raise HTTPException(422,'Cannot encode the current camera frame')
+    try:
+        run_id=workbench.reserve('camera_frame_test')
+    except ValueError as exc:
+        raise HTTPException(409,str(exc))
+    path=workbench.folder(run_id)/'input.png'
+    try:
+        path.write_bytes(encoded.tobytes())
+        workbench.media(run_id,path,'face',1,body.expected_identity.strip() if body.expected_identity else None,body.expected_count)
+        return {'id':run_id}
+    except Exception:
+        path.unlink(missing_ok=True)
+        with workbench.lock:
+            workbench.active_id=None
+        raise
+
+
+@app.post('/api/testing/runs',status_code=202)
+async def testing_media(file:UploadFile=File(...),mode:Literal['face','vehicle','scene','low_light','thermal']=Form('face'),
+                        max_frames:int=Form(30,ge=1,le=300),expected_identity:str|None=Form(None,max_length=100),
+                        expected_count:int|None=Form(None,ge=0,le=100)):
+    if expected_identity and mode!='face':
+        raise HTTPException(422,'Expected identity is supported in face mode only')
+    if expected_count is not None and mode=='low_light':
+        raise HTTPException(422,'Low-light enhancement does not estimate object counts')
+    suffix=Path(file.filename or '').suffix.lower()
+    if suffix not in {'.jpg','.jpeg','.png','.webp','.bmp','.mp4','.avi','.mov','.mkv','.webm'}:
+        raise HTTPException(422,'Upload a supported image or video')
+    try:
+        run_id=workbench.reserve('media_test')
+    except ValueError as exc:
+        raise HTTPException(409,str(exc))
+    path=workbench.folder(run_id)/f'input{suffix}'
+    try:
+        size=0
+        with path.open('wb') as dest:
+            while chunk:=await file.read(1024*1024):
+                size+=len(chunk)
+                if size>250*1024*1024:
+                    raise HTTPException(413,'Input limit is 250 MB')
+                dest.write(chunk)
+        if not size:
+            raise HTTPException(422,'Uploaded file is empty')
+        workbench.media(run_id,path,mode,max_frames,expected_identity.strip() if expected_identity else None,expected_count)
+        return {'id':run_id}
+    except Exception:
+        path.unlink(missing_ok=True)
+        with workbench.lock:
+            workbench.active_id=None
+        workbench.write(run_id,{'id':run_id,'kind':'media_test','status':'error','error':'Upload did not complete'})
+        raise
+
+
+@app.get('/api/testing/runs')
+def testing_history():
+    paths=sorted(workbench.directory.glob('*/report.json'),key=lambda path:path.stat().st_mtime,reverse=True)[:30]
+    result=[]
+    for path in paths:
+        try:
+            data=json.loads(path.read_text(encoding='utf-8'))
+            result.append({key:data.get(key) for key in ['id','kind','status','mode','verdict','created_at']})
+        except (OSError,ValueError):
+            continue
+    return result
+
+
+@app.get('/api/testing/runs/{run_id}')
+def testing_result(run_id:str):
+    try:
+        return workbench.get(run_id)
+    except (ValueError,FileNotFoundError):
+        raise HTTPException(404,'Test run not found')
+
+
+@app.get('/api/testing/runs/{run_id}/preview')
+def testing_preview(run_id:str):
+    try:
+        path=workbench.folder(run_id)/'preview.jpg'
+    except ValueError:
+        raise HTTPException(404,'Test run not found')
+    if not path.exists():
+        raise HTTPException(404,'Preview not available')
+    return FileResponse(path,media_type='image/jpeg')
+
+
+def health():
+    sources = camera_manager.list_cameras()
+    return {'cpu': psutil.cpu_percent(), 'memory': psutil.virtual_memory().percent, 'gpu': 0,
+            'fps': sum(source['fps'] for source in sources.values()), 'camera_online': any(source['running'] for source in sources.values()),
+            'device': 'cpu', 'physical_gate_excluded': True, 'live_camera_enabled': True, 'simulated': True, 'sources': sources}
+
+
+@app.get('/api/health')
+def get_health():
+    return {**health(), 'history': event_store.get_recent_health()}
+
+
+@app.websocket('/ws')
+async def websocket(websocket: WebSocket):
+    origin = websocket.headers.get('origin')
+    if (origin and origin not in ORIGINS) or not auth.user(websocket.cookies.get('ig_session')):
+        await websocket.close(code=1008)
+        return
     await ws_manager.connect(websocket)
     try:
-        # Send initial state on connect
-        await ws_manager.send_personal(websocket, {
-            "type":  "init",
-            "data":  event_store.get_stats(),
-        })
-        # Keep-alive: read pings from client (any text → pong)
+        await ws_manager.send_personal(websocket, {'type': 'init', 'data': event_store.get_stats()})
         while True:
-            msg = await websocket.receive_text()
-            if msg == "ping":
-                await ws_manager.send_personal(websocket, {"type": "pong"})
+            message = await websocket.receive_text()
+            if not auth.user(websocket.cookies.get('ig_session')):
+                await websocket.close(code=1008)
+                break
+            if message == 'ping':
+                await ws_manager.send_personal(websocket, {'type': 'pong'})
     except WebSocketDisconnect:
+        pass
+    finally:
         ws_manager.disconnect(websocket)
-    except Exception as e:
-        logger.debug(f"[WS] Connection error: {e}")
-        ws_manager.disconnect(websocket)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ── Serve React frontend (production) ─────────────────────────────────────────
+DIST = ROOT / 'module8_dashboard/frontend/dist'
+if DIST.exists():
+    app.mount('/assets', StaticFiles(directory=str(DIST / 'assets')), name='assets')
 
-_FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
-if _FRONTEND_DIST.exists():
-    from fastapi.responses import FileResponse
-
-    @app.get("/{full_path:path}", include_in_schema=False)
-    async def serve_spa(full_path: str):
-        """Serve React SPA for any unmatched path (client-side routing)."""
-        file = _FRONTEND_DIST / full_path
-        if file.exists() and file.is_file():
-            return FileResponse(str(file))
-        return FileResponse(str(_FRONTEND_DIST / "index.html"))
-
-    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets")), name="assets")
+    @app.get('/{full_path:path}', include_in_schema=False)
+    def spa(full_path: str):
+        if full_path.startswith('api/'):
+            raise HTTPException(404, 'Endpoint not found')
+        target = (DIST / full_path).resolve()
+        if target.is_relative_to(DIST.resolve()) and target.is_file():
+            return FileResponse(target)
+        return FileResponse(DIST / 'index.html')
