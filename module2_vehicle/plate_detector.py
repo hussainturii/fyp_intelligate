@@ -31,12 +31,15 @@ try:
 except ImportError:
     _YOLO_OK = False
 
-# ── HuggingFace plate detection model ────────────────────────────────────────
+# ── Model paths ─────────────────────────────────────────────────────────────
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TRAINED_PLATE_MODEL_PATH = _REPO_ROOT / "models" / "plate_detector_yolov8n.pt"
+_LEGACY_PLATE_MODEL_PATH = Path(__file__).parent / "models" / "license_plate_detector.pt"
 _PLATE_MODEL_URL = (
     "https://github.com/keremberke/awesome-yolov8-models/releases/download/"
     "v1.0.0/license_plate_detector.pt"
 )
-_PLATE_MODEL_PATH = Path(__file__).parent / "models" / "license_plate_detector.pt"
+_PLATE_MODEL_PATH = _TRAINED_PLATE_MODEL_PATH if _TRAINED_PLATE_MODEL_PATH.exists() else _LEGACY_PLATE_MODEL_PATH
 
 
 @dataclass
@@ -70,12 +73,23 @@ class PlateDetector:
         device: str = "cpu",
         model_path: Optional[str] = None,
         allow_download: bool = True,
+        force_classical: bool = False,
     ) -> None:
         self.conf   = confidence_threshold
         self.device = device
         self._model: Optional[YOLO] = None
+        self.force_classical = force_classical
 
-        path = Path(model_path) if model_path else _PLATE_MODEL_PATH
+        if self.force_classical:
+            logger.info("[PlateDetector] Forced classical contour mode enabled.")
+            return
+
+        if model_path:
+            path = Path(model_path)
+        elif _TRAINED_PLATE_MODEL_PATH.exists():
+            path = _TRAINED_PLATE_MODEL_PATH
+        else:
+            path = _LEGACY_PLATE_MODEL_PATH
 
         if _YOLO_OK and (path.exists() or allow_download):
             self._model = self._load_model(path)
@@ -203,8 +217,11 @@ class PlateDetector:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _load_model(self, path: Path) -> Optional[YOLO]:
-        """Load plate YOLO model, downloading if necessary."""
+        """Load plate YOLO model, downloading if necessary and safely handling CPU fallback."""
         if not path.exists():
+            if path.name == "plate_detector_yolov8n.pt":
+                logger.warning(f"[PlateDetector] Fine-tuned model not found at {path}. Falling back to classical.")
+                return None
             path.parent.mkdir(parents=True, exist_ok=True)
             logger.info(f"[PlateDetector] Downloading plate detection model...")
             try:
@@ -222,10 +239,25 @@ class PlateDetector:
                 )
                 return None
 
+        # Supply-chain verification for local model
         try:
+            from module8_dashboard.backend.model_integrity import verify_model_file
+            if path.name == "plate_detector_yolov8n.pt":
+                verify_model_file(str(path), strict=False)
+        except Exception:
+            pass
+
+        try:
+            import torch
+            target_device = self.device
+            if target_device.startswith("cuda") and not torch.cuda.is_available():
+                logger.warning(f"[PlateDetector] CUDA requested ({target_device}) but unavailable. Falling back to CPU.")
+                target_device = "cpu"
+                self.device = "cpu"
+
             model = YOLO(str(path))
-            model.to(self.device)
-            logger.success("[PlateDetector] Plate model loaded (YOLO).")
+            model.to(target_device)
+            logger.success(f"[PlateDetector] Plate model loaded (YOLO) from {path.name} on {target_device}.")
             return model
         except Exception as e:
             logger.warning(f"[PlateDetector] Failed to load model: {e}. Using classical fallback.")

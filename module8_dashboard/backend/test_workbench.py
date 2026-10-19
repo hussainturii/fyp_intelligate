@@ -126,7 +126,11 @@ def component_checks(root):
             auth.logout(token)
             require(auth.user(token) is None,'Logout did not revoke the session')
             reopened=EventStore(str(store.db_path))
-            require(reopened.count_events(since_hours=24)>0,'Events did not persist')
+            try:
+                require(reopened.count_events(since_hours=24)>0,'Events did not persist')
+            finally:
+                reopened.close()
+                store.close()
             return 'Temporary account, password verification, session/role lookup, logout and event persistence passed. HTTP RBAC is covered separately by pytest.'
         check('M10','Authentication and persistence',auth_storage)
     for module,name,detail in [
@@ -258,7 +262,10 @@ class TestWorkbench:
                         shutil.copyfile(current,sandbox/'vehicles.h5')
                     vehicle_db=VehicleDatabase(str(sandbox/'vehicles.h5'),str(sandbox/'unknown.h5'))
             def callback(event):
-                decision=runtime.observe(event) if event['module'] in {'face','vehicle'} else {'event_id':runtime.emit(event['module'],event['event_type'],event.get('identity'),**event.get('meta',{}))}
+                event_meta = event.setdefault('meta', {})
+                event_meta.setdefault('provenance', 'perception_internal')
+                event_meta.setdefault('trusted_perception', True)
+                decision=runtime.observe(event, trusted=True) if event['module'] in {'face','vehicle'} else {'event_id':runtime.emit(event['module'],event['event_type'],event.get('identity'),**event.get('meta',{}))}
                 records.append({**event,**decision})
             pipeline=ReplayPipeline(mode,runtime,callback,face_engine,vehicle_db,clock=lambda:timeline[0])
             capture=None
@@ -323,12 +330,14 @@ class TestWorkbench:
                 observed=[item['faces_detected'] if mode=='face' else item['count'] for item in face_frames]
                 assertions.append({'name':'Expected count on every sampled frame','status':'PASS' if observed and all(value==expected_count for value in observed) else 'FAIL',
                                    'expected':expected_count,'observed':observed})
+            gallery_cnt = len(face_engine.list()) if face_engine else None
+            store.close()
             return {'mode':mode,'frames_processed':len(latencies),'sampled_frames':face_frames,
                     'events':records,'event_count':len(records),'event_types':dict(Counter(row['event_type'] for row in records)),
                     'metrics':dict(pipeline.metrics),'assertions':assertions,
                     'verdict':('FAIL' if any(row['status']=='FAIL' for row in assertions) else 'PASS' if assertions else 'OBSERVED_NO_EXPECTATIONS'),
                     'timing':{'median_ms':round(float(np.median(latencies)),2),'p95_ms':round(float(np.percentile(latencies,95)),2)},
-                    'gallery_count':len(face_engine.list()) if face_engine else None,
+                    'gallery_count':gallery_cnt,
                     'preview_url':f'/api/testing/runs/{run_id}/preview',
                     'scope':'Uses a copied gallery and temporary events/device state; never opens the actual virtual gate or writes test visits to the live timeline. Video observations use source timestamps.',
                     'limitations':['No validated anti-spoofing or VLM/SSM inference.','An unlabeled successful execution is not an accuracy pass.','A single expected identity/count assertion is not a dataset accuracy benchmark.']}

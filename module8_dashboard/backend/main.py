@@ -34,6 +34,26 @@ CFG = yaml.safe_load((ROOT / 'config/config.yaml').read_text(encoding='utf-8'))
 DB_PATH = Path(os.environ.get('IG_EVENT_DB', str(ROOT / 'logs/events.db')))
 UPLOAD_DIR = DB_PATH.parent / 'video_uploads'
 ORIGINS = CFG['dashboard']['cors_origins'] + ['http://127.0.0.1:5173', 'http://127.0.0.1:8000']
+LAN_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$"
+
+
+def is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return True
+    if origin in ORIGINS:
+        return True
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        parsed = urlparse(origin)
+        host = parsed.hostname
+        if host in {'localhost', '127.0.0.1', '::1'}:
+            return True
+        ip = ipaddress.ip_address(host)
+        return ip.is_private
+    except Exception:
+        return False
+
 event_store = runtime = auth = None
 face_engine = vehicle_db = None
 main_loop = None
@@ -61,7 +81,10 @@ def get_vehicles():
 
 
 def on_pipeline_event(event):
-    result = runtime.observe(event) if event['module'] in {'face', 'vehicle'} else {
+    event_meta = event.setdefault('meta', {})
+    event_meta['provenance'] = 'perception_internal'
+    event_meta['trusted_perception'] = True
+    result = runtime.observe(event, trusted=True) if event['module'] in {'face', 'vehicle'} else {
         'event_id': runtime.emit(event['module'], event['event_type'], event.get('identity'), **(event.get('meta') or {}))}
     if event['module'] in {'queue', 'visitors'} and event['event_type'] in {'congestion', 'loitering'}:
         event_store.log_alert('MEDIUM', event['event_type'], event['event_type'].replace('_', ' ').title(), event_id=result['event_id'])
@@ -117,7 +140,7 @@ async def background():
 
 
 app = FastAPI(title='IntelliGate software prototype', version='2.0', lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_origin_regex=LAN_ORIGIN_REGEX, allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
 
 
 @app.middleware('http')
@@ -126,7 +149,7 @@ async def authorization(request: Request, call_next):
     if path.startswith('/api/'):
         if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
             origin = request.headers.get('origin')
-            if origin and origin not in ORIGINS:
+            if origin and not is_allowed_origin(origin):
                 return JSONResponse({'detail': 'Origin is not allowed'}, status_code=403)
         if path not in {'/api/auth/status', '/api/auth/setup', '/api/auth/login'} and request.method != 'OPTIONS':
             user = auth.user(request.cookies.get('ig_session')) if auth else None
@@ -206,14 +229,38 @@ def events(module: str | None = None, event_type: str | None = None, since_hours
 
 
 @app.post('/api/events')
-async def add_event(body: EventIn):
-    # External/test events cannot self-assert validated biometric access.
+async def add_event(body: EventIn, request: Request):
+    user = getattr(request.state, 'user', None)
+    if not user or user.get('role') not in {'admin', 'security_staff'}:
+        raise HTTPException(403, 'Operator role required to submit events')
+
+    # Explicit Server-Side Provenance Boundary:
+    # All external events over HTTP are stamped with operator provenance metadata.
+    # They can never impersonate internal perception pipelines or assert validated access.
     event = body.model_dump()
+    event['meta'] = dict(event.get('meta') or {})
+    event['meta']['provenance'] = 'operator_annotation'
+    event['meta']['submitted_by'] = user['username']
+    event['meta']['client_ip'] = request.client.host if request.client else 'unknown'
+    event['meta']['trusted_perception'] = False
     event['meta']['validated_liveness'] = False
     event['meta']['ocr_confidence'] = 0
-    result = runtime.observe(event)
+    if event.get('method') in {'exact_plate', 'face_recognition', 'reid'}:
+        event['method'] = f"operator_reported_{event['method']}"
+
+    result = runtime.observe(event, trusted=False)
     await ws_manager.broadcast_event('event', {**event, **result})
     return result
+
+
+@app.get('/api/system/models')
+def system_models(request: Request):
+    """Supply-chain inventory and verification status of active model weights."""
+    user = getattr(request.state, 'user', None)
+    if not user or user.get('role') not in {'admin', 'security_staff'}:
+        raise HTTPException(403, 'Operator role required to view model supply-chain details')
+    from .model_integrity import get_model_inventory
+    return {'models': get_model_inventory()}
 
 
 @app.get('/api/alerts')
@@ -306,8 +353,17 @@ async def register_vehicle(request: Request, plate: str = Form(..., min_length=1
         db = get_vehicles()
         if plate in db._plate_map:
             raise HTTPException(409, 'Plate already registered')
-        vid = db.register(plate, owner.strip(), embedding=appearance(frame) if frame is not None else None,
-                          notes='CPU colour histogram baseline; upload a cropped vehicle image')
+        emb = None
+        notes = 'Plate registration without vehicle image'
+        if frame is not None:
+            try:
+                from module2_vehicle.vehicle_reid import VehicleReID
+                emb = VehicleReID().extract_embedding(frame)
+                notes = 'OSNet-AIN 512-D deep vehicle metric embedding'
+            except Exception:
+                emb = appearance(frame)
+                notes = 'CPU colour histogram baseline fallback'
+        vid = db.register(plate, owner.strip(), embedding=emb, notes=notes)
         for pipeline in pipelines.values():
             pipeline.invalidate_vehicle_gallery()
     runtime.emit('identity', 'vehicle_registered', plate, actor=request.state.user['username'])
@@ -325,7 +381,7 @@ def delete_vehicle(plate: str):
     return {'status': 'deleted'}
 
 
-def configure_source(source_id, mode, path=None):
+def configure_source(source_id, mode, path=None, network_url=None, network_token=None):
     with pipeline_lock:
         # Single active inference source is deliberate on this 8 GB CPU host.
         previous_sources = list(pipelines)
@@ -338,12 +394,15 @@ def configure_source(source_id, mode, path=None):
                                   runtime.load('scene_config', {}))
         pipeline.source_id = source_id
         pipeline.replayed = path is not None
-        if not camera_manager.add_camera(source_id, 960, 540, video_path=str(path) if path else None, pipeline_func=pipeline.process_frame):
-            raise ValueError('Cannot open camera/video: check camera index, Windows permissions and other camera apps')
+        if not camera_manager.add_camera(source_id, 960, 540, video_path=str(path) if path else None,
+                                         pipeline_func=pipeline.process_frame,
+                                         network_url=network_url, network_token=network_token):
+            raise ValueError('Cannot open camera/video: check camera index, permissions, network connection and other camera apps')
         pipelines[source_id] = pipeline
-        label = Path(path).name if path else f'Camera {source_id}'
-        runtime.emit('sources', 'replay_started' if path else 'camera_started', label, mode=mode, source_id=source_id)
-        return {'cam_id': source_id, 'mode': mode, 'status': 'updated', 'replayed': path is not None, 'filename': label}
+        label = network_url if network_url else Path(path).name if path else f'Camera {source_id}'
+        runtime.emit('sources', 'remote_camera_started' if network_url else 'replay_started' if path else 'camera_started',
+                     label, mode=mode, source_id=source_id)
+        return {'cam_id': source_id, 'mode': mode, 'status': 'updated', 'replayed': path is not None, 'remote': network_url is not None, 'filename': label}
 
 
 @app.post('/api/cameras/{cam_id}/upload-video')
@@ -417,6 +476,34 @@ async def start_source(cam_id: int, mode: SOURCE_MODES = Query('face')):
         return await asyncio.to_thread(configure_source,cam_id,mode)
     except Exception as exc:
         raise HTTPException(422,str(exc))
+
+
+class RemoteCameraIn(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
+    token: str = Field('', max_length=200)
+    mode: SOURCE_MODES = 'face'
+
+
+@app.post('/api/cameras/{cam_id}/network')
+async def start_remote_source(cam_id: int, body: RemoteCameraIn, request: Request):
+    if not 0 <= cam_id <= 7:
+        raise HTTPException(422, 'Camera index must be 0-7')
+    if body.mode == 'thermal':
+        raise HTTPException(422, 'Use genuine infrared recordings for thermal mode')
+
+    user = getattr(request.state, 'user', None)
+    if not user or user.get('role') not in {'admin', 'security_staff'}:
+        raise HTTPException(403, 'Operator role required to configure camera sources')
+
+    from .camera_manager import validate_camera_url
+    ok, err_msg, valid_url = validate_camera_url(body.url)
+    if not ok:
+        raise HTTPException(422, f'Remote camera URL rejected: {err_msg}')
+
+    try:
+        return await asyncio.to_thread(configure_source, cam_id, body.mode, None, valid_url, body.token.strip())
+    except Exception as exc:
+        raise HTTPException(422, str(exc))
 
 
 class CameraEnrolment(BaseModel):
@@ -674,7 +761,7 @@ def get_health():
 @app.websocket('/ws')
 async def websocket(websocket: WebSocket):
     origin = websocket.headers.get('origin')
-    if (origin and origin not in ORIGINS) or not auth.user(websocket.cookies.get('ig_session')):
+    if (origin and not is_allowed_origin(origin)) or not auth.user(websocket.cookies.get('ig_session')):
         await websocket.close(code=1008)
         return
     await ws_manager.connect(websocket)

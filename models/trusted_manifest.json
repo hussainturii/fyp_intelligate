@@ -1,0 +1,67 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-10-18T13:15:00Z",
+  "models": {
+    "face_detection_yunet_2023mar.onnx": {
+      "relative_path": "models/face_detection_yunet_2023mar.onnx",
+      "sha256": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+      "size_bytes": 232589,
+      "format": "ONNX",
+      "license": "Apache-2.0",
+      "source": "https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
+      "task": "face_detection_landmarks",
+      "input_resolution": [640, 360]
+    },
+    "face_recognition_sface_2021dec.onnx": {
+      "relative_path": "models/face_recognition_sface_2021dec.onnx",
+      "sha256": "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+      "size_bytes": 38696353,
+      "format": "ONNX",
+      "license": "Apache-2.0",
+      "source": "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface",
+      "task": "face_feature_extraction_128d",
+      "input_resolution": [112, 112]
+    },
+    "yolov8n.pt": {
+      "relative_path": "yolov8n.pt",
+      "sha256": "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
+      "size_bytes": 6549796,
+      "format": "PyTorch",
+      "license": "AGPL-3.0",
+      "source": "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt",
+      "task": "vehicle_and_person_detection",
+      "input_resolution": [416, 416]
+    },
+    "plate_detector_yolov8n.pt": {
+      "relative_path": "models/plate_detector_yolov8n.pt",
+      "sha256": "d9dbcbdc5aab557860136995b0f099f6a36bd44d1075017648529542d21e322c",
+      "size_bytes": 6508643,
+      "format": "PyTorch",
+      "license": "AGPL-3.0",
+      "source": "fine-tuned local (Milestone 3B)",
+      "task": "license_plate_detection",
+      "input_resolution": [640, 640]
+    },
+    "2.7_80x80_MiniFASNetV2.pth": {
+      "relative_path": "models/2.7_80x80_MiniFASNetV2.pth",
+      "sha256": "a5eb02e1843f19b5386b953cc4c9f011c3f985d0ee2bb9819eea9a142099bec0",
+      "size_bytes": 1849453,
+      "format": "PyTorch",
+      "license": "Apache-2.0",
+      "source": "https://github.com/minivision-ai/Silent-Face-Anti-Spoofing",
+      "task": "presentation_attack_detection",
+      "input_resolution": [80, 80]
+    },
+    "osnet_ain_x1_0_vehicle_reid.onnx": {
+      "relative_path": "models/osnet_ain_x1_0_vehicle_reid.onnx",
+      "sha256": "4aaad3e5db648618b0df3d2ff21c61323985ff9e50194c3d2edd4fb87c92d91f",
+      "sha384": "0515ce72f653c39780d5b87dfed7255d396dd2b1e8b6e91fbaacdfad1da189166343157273c02f3b0fede3050ef7abb7",
+      "size_bytes": 8836743,
+      "format": "ONNX",
+      "license": "MIT",
+      "source": "https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/vehicle-reid-0001/osnet_ain_x1_0_vehicle_reid.onnx",
+      "task": "vehicle_re_identification_512d",
+      "input_resolution": [208, 208]
+    }
+  }
+}

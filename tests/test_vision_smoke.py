@@ -37,7 +37,7 @@ def test_real_face_enrolment_requires_review_before_virtual_open(engine):
     identity = engine.register('OpenCV static sample', 'test', frame)
     runtime = SoftwareRuntime(engine.store)
     results = []
-    pipeline = ReplayPipeline('face', runtime, lambda event:results.append(runtime.observe(event)), engine)
+    pipeline = ReplayPipeline('face', runtime, lambda event:results.append(runtime.observe(event, trusted=True)), engine)
     assert pipeline.process_frame(frame)['faces_detected'] == 1
     assert results[0]['decision'] == 'REVIEW_REQUIRED'
     assert runtime.gate()['state'] == 'CLOSED'

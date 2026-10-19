@@ -97,30 +97,41 @@ class PresenceLedger:
 
 
 class FaceEngine:
-    """YuNet/SFace CPU recognition; liveness stays advisory until benchmarked."""
     def __init__(self, store):
+        from .model_integrity import verify_model_file
+        from .key_manager import resolve_biometric_key
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         model_dir = ROOT / 'models'
         paths = [model_dir / 'face_detection_yunet_2023mar.onnx', model_dir / 'face_recognition_sface_2021dec.onnx']
-        if not all(p.exists() for p in paths):
-            raise RuntimeError('Face models missing. Run python tools/download_face_models.py')
+        verify_model_file('models/face_detection_yunet_2023mar.onnx')
+        verify_model_file('models/face_recognition_sface_2021dec.onnx')
         self.detector = cv2.FaceDetectorYN.create(str(paths[0]), '', (640, 360), 0.8, 0.3, 5000)
         self.recognizer = cv2.FaceRecognizerSF.create(str(paths[1]), '')
         self.store = store
         self.gallery_revision = 0
+        self._gallery_cache_rev = -1
+        self._gallery_cache = []
+        self._stranger_cache = []
+        self._last_stranger_prune = 0.0
         self.lock = INFERENCE_LOCK
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        import os
-        key_path = store.db_path.parent / 'biometric.key'
-        try:
-            fd = os.open(str(key_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            with os.fdopen(fd, 'wb') as f:
-                f.write(AESGCM.generate_key(bit_length=256))
-        self.cipher = AESGCM(key_path.read_bytes())
+
+        key_bytes = resolve_biometric_key(store)
+        self.cipher = AESGCM(key_bytes)
         with store._conn() as db:
             db.execute('CREATE TABLE IF NOT EXISTS cpu_faces (id TEXT PRIMARY KEY, name TEXT UNIQUE, role TEXT, embedding BLOB, created REAL)')
+            db.execute('CREATE TABLE IF NOT EXISTS cpu_strangers (id TEXT PRIMARY KEY, embedding BLOB, seen REAL)')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_cpu_strangers_seen ON cpu_strangers(seen)')
+            cutoff = time.time() - 90 * 86400
+            db.execute('DELETE FROM cpu_strangers WHERE seen<?', (cutoff,))
+            rows = db.execute('SELECT id, embedding, seen FROM cpu_strangers ORDER BY seen DESC LIMIT 1000').fetchall()
+            for r in rows:
+                try:
+                    dec = self.open(r['embedding'], r['id'])
+                    self._stranger_cache.append((r['id'], dec, r['seen']))
+                except Exception:
+                    pass
+        self._last_stranger_prune = time.time()
 
     def detect(self, frame):
         self.detector.setInputSize((frame.shape[1], frame.shape[0]))
@@ -168,28 +179,58 @@ class FaceEngine:
         return removed
 
     def match(self, embedding):
-        with self.store._conn() as db:
-            rows = db.execute('SELECT id,name,embedding FROM cpu_faces').fetchall()
-        matches = [(float(np.dot(embedding, self.open(r['embedding'], r['id']))), r['name']) for r in rows]
-        return max(matches, default=(0, None))
+        if self._gallery_cache_rev != self.gallery_revision:
+            with self.store._conn() as db:
+                rows = db.execute('SELECT id,name,embedding FROM cpu_faces').fetchall()
+            cached = []
+            for r in rows:
+                try:
+                    dec = self.open(r['embedding'], r['id'])
+                    cached.append((dec, r['name']))
+                except Exception:
+                    pass
+            self._gallery_cache = cached
+            self._gallery_cache_rev = self.gallery_revision
+
+        if not self._gallery_cache:
+            return (0.0, None)
+        matches = [(float(np.dot(embedding, emb)), name) for emb, name in self._gallery_cache]
+        return max(matches, default=(0.0, None))
 
     def stranger(self, embedding):
-        with self.store._conn() as db:
-            db.execute('CREATE TABLE IF NOT EXISTS cpu_strangers (id TEXT PRIMARY KEY, embedding BLOB, seen REAL)')
-            db.execute('DELETE FROM cpu_strangers WHERE seen<?', (time.time() - 90 * 86400,))
-            rows = db.execute('SELECT * FROM cpu_strangers').fetchall()
-            matches = [(float(np.dot(embedding, self.open(r['embedding'], r['id']))), r['id']) for r in rows]
-            score, identity = max(matches, default=(0, None))
-            if score < 0.45:
-                identity = str(uuid.uuid4())
-                db.execute('INSERT INTO cpu_strangers VALUES (?,?,?)', (identity, self.seal(embedding, identity), time.time()))
-            else:
-                db.execute('UPDATE cpu_strangers SET seen=? WHERE id=?', (time.time(), identity))
-        return identity
+        now = time.time()
+        if now - self._last_stranger_prune > 3600:
+            with self.store._conn() as db:
+                db.execute('DELETE FROM cpu_strangers WHERE seen<?', (now - 90 * 86400,))
+            self._stranger_cache = [item for item in self._stranger_cache if item[2] >= now - 90 * 86400]
+            self._last_stranger_prune = now
+
+        best_score = 0.0
+        best_id = None
+        best_idx = -1
+        for idx, (s_id, s_emb, _) in enumerate(self._stranger_cache):
+            score = float(np.dot(embedding, s_emb))
+            if score > best_score:
+                best_score = score
+                best_id = s_id
+                best_idx = idx
+
+        if best_score < 0.45 or best_id is None:
+            identity = str(uuid.uuid4())
+            sealed = self.seal(embedding, identity)
+            with self.store._conn() as db:
+                db.execute('INSERT INTO cpu_strangers VALUES (?,?,?)', (identity, sealed, now))
+            self._stranger_cache.append((identity, embedding, now))
+            return identity
+        else:
+            self._stranger_cache[best_idx] = (best_id, self._stranger_cache[best_idx][1], now)
+            with self.store._conn() as db:
+                db.execute('UPDATE cpu_strangers SET seen=? WHERE id=?', (now, best_id))
+            return best_id
 
 
 class ReplayPipeline:
-    def __init__(self, mode, runtime, callback, face_engine=None, vehicle_db=None, config=None, clock=None):
+    def __init__(self, mode, runtime, callback, face_engine=None, vehicle_db=None, config=None, clock=None, device=None):
         self.mode, self.runtime, self.callback = mode, runtime, callback
         self.faces, self.vehicle_db = face_engine, vehicle_db
         self.config = config or {}
@@ -208,21 +249,47 @@ class ReplayPipeline:
         self.overlay_lock = threading.Lock()
         self.overlays = []
         self.scene_overlay = None
-        self.metrics = {'frames': 0, 'latency_ms': 0, 'mode': mode, 'last_error': None,
+        # Device selection: explicit override or automatic CUDA detection with clean CPU fallback
+        if device is not None:
+            self.device = device
+        else:
+            try:
+                import torch
+                self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+            except Exception:
+                self.device = 'cpu'
+
+        self.pad_detector = None
+        self.metrics = {'frames': 0, 'latency_ms': 0, 'mode': mode, 'device': self.device, 'last_error': None,
                         'recognition_runs': 0, 'recognition_cache_hits': 0, 'visible_tracks': 0,
                         'faces_detected':0,'recognized_faces':0,'unknown_faces':0,'pending_faces':0,
-                        'status':'starting','face_results':[]}
+                        'pad_bona_fide':0, 'pad_attack_suspected':0, 'pad_inconclusive':0, 'pad_not_evaluated':0,
+                        'status':'starting','face_results':[], 'stage_latencies': {}}
+        if mode == 'face':
+            try:
+                from module1_face_recognition.anti_spoofing.deep_pad import MiniFASNetV2Detector
+                self.pad_detector = MiniFASNetV2Detector(device=self.device)
+            except Exception as exc:
+                self.metrics['last_error'] = f"Failed to initialize PAD detector: {exc}"
+                self.pad_detector = None
         if mode in {'vehicle', 'scene', 'thermal'}:
+            from .model_integrity import verify_model_file
+            verify_model_file('yolov8n.pt')
             from ultralytics import YOLO
             path = ROOT / 'yolov8n.pt'
-            if not path.exists():
-                raise RuntimeError('yolov8n.pt missing; download the documented pretrained detector')
             self.model = YOLO(str(path))
+        self.vehicle_reid = None
         if mode == 'vehicle':
             from module2_vehicle.plate_detector import PlateDetector
             from module2_vehicle.plate_ocr import PlateOCR
-            self.plate_detector = PlateDetector(device='cpu', allow_download=False)
-            self.ocr = PlateOCR(languages=['en'], gpu=False, n_reads=1, min_confidence=0.55)
+            use_gpu = self.device.startswith('cuda')
+            self.plate_detector = PlateDetector(device=self.device, allow_download=False)
+            self.ocr = PlateOCR(languages=['en'], gpu=use_gpu, n_reads=1, min_confidence=0.55)
+            try:
+                from module2_vehicle.vehicle_reid import VehicleReID
+                self.vehicle_reid = VehicleReID()
+            except Exception as exc:
+                self.vehicle_reid = None
 
     def send(self, kind, module, identity=None, confidence=None, method=None, meta=None, key=None, cooldown=10):
         if not self.active:
@@ -269,64 +336,170 @@ class ReplayPipeline:
     def invalidate_vehicle_gallery(self):
         self.vehicle_states.clear()
 
-    def _faces(self, frame):
+    def _faces(self, frame, start_time=None):
+        t0 = start_time or time.perf_counter()
         now = self.clock()
-        detections = self.faces.detect(frame)
-        self.metrics.update(faces_detected=len(detections),recognized_faces=0,unknown_faces=0,pending_faces=0,face_results=[])
-        boxes = [((float(f[0]),float(f[1]),float(f[0]+f[2]),float(f[1]+f[3])), 'face', float(f[-1])) for f in detections]
+        t_det_0 = time.perf_counter()
+        detections = self.faces.detect(frame) if self.faces is not None else []
+        t_det_1 = time.perf_counter()
+        self.metrics.update(faces_detected=len(detections), recognized_faces=0, unknown_faces=0, pending_faces=0,
+                            pad_bona_fide=0, pad_attack_suspected=0, pad_inconclusive=0, pad_not_evaluated=0,
+                            face_results=[])
+        boxes = [((float(f[0]), float(f[1]), float(f[0] + f[2]), float(f[1] + f[3])), 'face', float(f[-1])) for f in detections]
+        t_track_0 = time.perf_counter()
         tracks = self.tracker.update(boxes, now)
+        t_track_1 = time.perf_counter()
         alive = set(self.tracker.tracks)
-        self.face_states = {key: state for key,state in self.face_states.items() if key in alive}
+        self.face_states = {key: state for key, state in self.face_states.items() if key in alive}
         self.presence.prune(now)
         objects = []
+        total_pad_ms = 0.0
+        total_rec_ms = 0.0
+
         for face, track in zip(detections, tracks):
             tid = track['track_id']
             state = self.face_states.get(tid)
-            x,y,w,h = map(int, face[:4])
-            crop = frame[max(0,y):min(frame.shape[0],y+h),max(0,x):min(frame.shape[1],x+w)]
-            fingerprint=crop_fingerprint(crop)
-            attempts = state.get('attempts',1) if state else 0
+            x, y, w, h = map(int, face[:4])
+            crop = frame[max(0, y):min(frame.shape[0], y + h), max(0, x):min(frame.shape[1], x + w)]
+            fingerprint = crop_fingerprint(crop)
+            attempts = state.get('attempts', 1) if state else 0
             if state and fingerprint is not None and state.get('fingerprint') is not None and float(np.mean(fingerprint != state['fingerprint'])) > .38:
                 state = None
             if state and not state['known'] and attempts < 3 and face[2] >= state['crop_width'] * 1.5:
                 state = None  # An unknown face is materially clearer/closer; try again.
-            revision = getattr(self.faces, 'gallery_revision', 0)
+            revision = getattr(self.faces, 'gallery_revision', 0) if self.faces is not None else 0
             if state is not None and state['revision'] != revision:
                 state = None
+
             if state is None:
                 # Wait for a usable crop, rather than caching a tiny/blurred face.
-                quality = crop.size > 0 and min(w,h) >= 35
+                quality = crop.size > 0 and min(w, h) >= 35
                 if not quality:
                     self.metrics['pending_faces'] += 1
-                    objects.append({'box':track['box'],'text':f'Face #{tid}: move closer','color':(0,170,255),'seen':now})
+                    self.metrics['pad_not_evaluated'] += 1
+                    objects.append({'box': track['box'], 'text': f'Face #{tid}: move closer', 'color': (0, 170, 255), 'seen': now})
                     continue
-                embedding = self.faces.feature(frame, face)
-                score, name = self.faces.match(embedding)
+
+                # Presentation Attack Detection (MiniFASNetV2)
+                t_pad_0 = time.perf_counter()
+                if self.pad_detector is not None:
+                    pad_result = self.pad_detector.evaluate_face(frame, (x, y, w, h))
+                else:
+                    pad_result = {
+                        'pad_status': 'NOT_EVALUATED',
+                        'pad_model': 'none',
+                        'pad_score': None,
+                        'pad_threshold': {'bona_fide': 0.80, 'attack': 0.40},
+                        'pad_inference_ms': 0.0,
+                        'pad_quality_status': 'no_detector_loaded',
+                        'device': self.device
+                    }
+                pad_inf_time = (time.perf_counter() - t_pad_0) * 1000.0
+                total_pad_ms += pad_result.get('pad_inference_ms', pad_inf_time)
+
+                # SFace Feature Extraction & Matching
+                t_rec_0 = time.perf_counter()
+                embedding = self.faces.feature(frame, face) if self.faces is not None else np.zeros(128, dtype=np.float32)
+                score, name = self.faces.match(embedding) if self.faces is not None else (0.0, None)
+                total_rec_ms += (time.perf_counter() - t_rec_0) * 1000.0
+
                 known = score >= .45 and name is not None
-                identity = name if known else self.faces.stranger(embedding)
-                state = {'name':name if known else 'Unknown', 'identity':identity,'known':known,'score':score,'revision':revision,
-                         'crop_width':float(face[2]),'attempts':attempts+1}
+                identity = name if known else (self.faces.stranger(embedding) if self.faces is not None else str(uuid.uuid4()))
+                state = {
+                    'name': name if known else 'Unknown',
+                    'identity': identity,
+                    'known': known,
+                    'score': score,
+                    'revision': revision,
+                    'crop_width': float(face[2]),
+                    'attempts': attempts + 1,
+                    'pad_status': pad_result['pad_status'],
+                    'pad_score': pad_result['pad_score'],
+                    'pad_model': pad_result.get('pad_model', 'MiniFASNetV2-80x80-2.7'),
+                    'pad_quality_status': pad_result.get('pad_quality_status', 'optimal'),
+                    'pad_inference_ms': pad_result.get('pad_inference_ms', round(pad_inf_time, 2)),
+                    'pad_threshold': pad_result.get('pad_threshold', {'bona_fide': 0.80, 'attack': 0.40})
+                }
                 self.face_states[tid] = state
                 self.metrics['recognition_runs'] += 1
             else:
                 self.metrics['recognition_cache_hits'] += 1
-            state['fingerprint']=fingerprint
+
+            # Update metrics per PAD outcome
+            pad_st = state.get('pad_status', 'NOT_EVALUATED')
+            if pad_st == 'BONA_FIDE_CANDIDATE':
+                self.metrics['pad_bona_fide'] += 1
+            elif pad_st == 'ATTACK_SUSPECTED':
+                self.metrics['pad_attack_suspected'] += 1
+            elif pad_st == 'INCONCLUSIVE':
+                self.metrics['pad_inconclusive'] += 1
+            else:
+                self.metrics['pad_not_evaluated'] += 1
+
+            state['fingerprint'] = fingerprint
             self.metrics['recognized_faces' if state['known'] else 'unknown_faces'] += 1
-            self.metrics['face_results'].append({'track_id':tid,'label':state['name'],'known':state['known'],
-                                                'similarity':round(float(state['score']),4),'threshold':.45,
-                                                'box':[round(v,1) for v in track['box']]})
-            fresh, visit_id = self.presence.touch(('face',state['identity']),now)
+            self.metrics['face_results'].append({
+                'track_id': tid,
+                'label': state['name'],
+                'known': state['known'],
+                'similarity': round(float(state['score']), 4),
+                'threshold': .45,
+                'box': [round(v, 1) for v in track['box']],
+                'pad_status': state['pad_status'],
+                'pad_score': state['pad_score'],
+                'pad_model': state['pad_model'],
+                'pad_threshold': state['pad_threshold'],
+                'pad_inference_ms': state['pad_inference_ms'],
+                'pad_quality_status': state['pad_quality_status']
+            })
+
+            fresh, visit_id = self.presence.touch(('face', state['identity']), now)
             if fresh:
-                self.send('access_granted' if state['known'] else 'stranger_alert','face',state['identity'],state['score'],'SFace',
-                          {'validated_liveness':False,'stranger_id':None if state['known'] else state['identity'],
-                           'track_id':tid,'session_id':f'{self.session_id}:{visit_id}',
-                           'liveness_status':'unvalidated: manual approval required','threshold':.45},
-                          key=('face_visit',visit_id),cooldown=0)
-            objects.append({'box':track['box'],'text':f"{state['name']}  #{tid}",
-                            'color':(0,170,0) if state['known'] else (0,0,230),'seen':now})
+                if state['pad_status'] == 'ATTACK_SUSPECTED':
+                    self.send('spoof_detected', 'face', state['identity'], state['pad_score'], state['pad_model'],
+                              {'validated_liveness': False, 'stranger_id': None if state['known'] else state['identity'],
+                               'track_id': tid, 'session_id': f'{self.session_id}:{visit_id}',
+                               'liveness_status': 'ATTACK_SUSPECTED: rejected by deep PAD (MiniFASNetV2)',
+                               'pad_status': state['pad_status'], 'pad_score': state['pad_score'],
+                               'pad_model': state['pad_model'], 'pad_quality_status': state['pad_quality_status'],
+                               'similarity': round(float(state['score']), 4), 'threshold': .45,
+                               'provenance': 'perception_internal', 'trusted_perception': True},
+                              key=('face_visit', visit_id), cooldown=0)
+                else:
+                    self.send('access_granted' if state['known'] else 'stranger_alert', 'face', state['identity'], round(float(state['score']), 4), 'SFace',
+                              {'validated_liveness': False, 'stranger_id': None if state['known'] else state['identity'],
+                               'track_id': tid, 'session_id': f'{self.session_id}:{visit_id}',
+                               'liveness_status': f"unvalidated ({state['pad_status'].lower()}): manual approval required",
+                               'pad_status': state['pad_status'], 'pad_score': state['pad_score'],
+                               'pad_model': state['pad_model'], 'pad_quality_status': state['pad_quality_status'],
+                               'similarity': round(float(state['score']), 4), 'threshold': .45,
+                               'provenance': 'perception_internal', 'trusted_perception': True},
+                              key=('face_visit', visit_id), cooldown=0)
+
+            # Box overlay styling based on PAD outcome and identity
+            if state['pad_status'] == 'ATTACK_SUSPECTED':
+                box_color = (0, 0, 230)
+                box_text = f"SPOOF #{tid} ({state['name']})"
+            elif state['known']:
+                box_color = (0, 170, 0)
+                box_text = f"{state['name']}  #{tid}"
+            else:
+                box_color = (0, 0, 230)
+                box_text = f"{state['name']}  #{tid}"
+
+            objects.append({'box': track['box'], 'text': box_text, 'color': box_color, 'seen': now})
+
         self.metrics['visible_tracks'] = len(tracks)
         self.publish_overlays(objects)
-        return {'annotated_frame':self.overlay_frame(frame),'faces_detected':len(detections),'tracks':objects}
+        t_faces_end = time.perf_counter()
+        self.metrics['stage_latencies'] = {
+            'detection_ms': round((t_det_1 - t_det_0) * 1000, 2),
+            'pad_ms': round(total_pad_ms, 2),
+            'recognition_ms': round(total_rec_ms, 2),
+            'tracking_ms': round((t_track_1 - t_track_0) * 1000, 2),
+            'total_cycle_ms': round((t_faces_end - t0) * 1000, 2)
+        }
+        return {'annotated_frame': self.overlay_frame(frame), 'faces_detected': len(detections), 'tracks': objects}
 
     def process_frame(self, frame):
         start = time.perf_counter()
@@ -334,7 +507,7 @@ class ReplayPipeline:
             if not self.active:
                 return {'annotated_frame':frame}
             try:
-                result = self._process(frame)
+                result = self._process(frame, start_time=start)
                 self.metrics['last_error'] = None
                 self.metrics['status']='running'
                 return result
@@ -346,7 +519,8 @@ class ReplayPipeline:
                 self.metrics['latency_ms'] = round((time.perf_counter() - start) * 1000, 1)
                 self.metrics['frames'] += 1
 
-    def _process(self, frame):
+    def _process(self, frame, start_time=None):
+        t0 = start_time or time.perf_counter()
         frame = frame.copy()
         luminance = float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean())
         profile = 'infrared_replay' if self.mode == 'thermal' else ('low_light' if luminance < 35 else 'day' if luminance > 55 else self.last_profile or 'day')
@@ -358,14 +532,18 @@ class ReplayPipeline:
             cv2.putText(adjusted, 'CLAHE enhancement - RGB, not thermal', (10, 50), 0, 0.5, (0, 255, 255), 1)
             return {'annotated_frame': adjusted, 'luminance': luminance, 'profile': 'low_light'}
         if self.mode == 'face':
-            return self._faces(frame)
+            return self._faces(frame, start_time=t0)
         if self.model is None:
             return {'annotated_frame': frame}
         if self.mode == 'scene' and profile == 'low_light':
             frame = enhance(frame)
-        prediction = self.model.predict(frame, imgsz=416, conf=0.4, classes=[0, 2, 3, 5, 7], device='cpu', verbose=False)[0]
+        t_det_0 = time.perf_counter()
+        prediction = self.model.predict(frame, imgsz=416, conf=0.4, classes=[0, 2, 3, 5, 7], device=self.device, verbose=False)[0]
+        t_det_1 = time.perf_counter()
         detections = [(tuple(box.xyxy[0].cpu().tolist()), self.model.names[int(box.cls[0])], float(box.conf[0])) for box in prediction.boxes]
+        t_track_0 = time.perf_counter()
         tracks = self.tracker.update(detections, self.clock())
+        t_track_1 = time.perf_counter()
         self.metrics['visible_tracks'] = len(tracks)
         self.presence.prune(self.clock())
         self.vehicle_states = {key: state for key,state in self.vehicle_states.items() if key in self.tracker.tracks}
@@ -422,6 +600,13 @@ class ReplayPipeline:
                     text, color = state['text'], state['color']
             objects.append({'box':track['box'],'text':text,'color':color,'seen':self.clock()})
         self.publish_overlays(objects)
+        t_proc_end = time.perf_counter()
+        self.metrics['stage_latencies'] = {
+            'preprocessing_ms': round((t_det_0 - t0) * 1000, 2),
+            'detector_inference_ms': round((t_det_1 - t_det_0) * 1000, 2),
+            'tracking_ms': round((t_track_1 - t_track_0) * 1000, 2),
+            'total_cycle_ms': round((t_proc_end - t0) * 1000, 2)
+        }
         frame = self.overlay_frame(frame)
         for region, color in [(roi,(255,150,0)), (gate_roi,(0,0,255))]:
             cv2.rectangle(frame, (int(region[0]*width),int(region[1]*height)), (int(region[2]*width),int(region[3]*height)), color, 1)
@@ -430,21 +615,59 @@ class ReplayPipeline:
 
     def _vehicle(self, crop, track_id):
         plate, confidence = '', 0
-        plates = self.plate_detector.detect(crop)
+        plates = self.plate_detector.detect(crop) if self.plate_detector else []
         if plates:
             result = self.ocr.read(plates[0].crop)
             plate, confidence = ''.join(c for c in result.clean_text.upper() if c.isalnum()), result.confidence
-        match = self.vehicle_db.lookup_by_plate(plate) if plate else None
-        if match and match['method'] != 'exact_plate':
+        match = self.vehicle_db.lookup_by_plate(plate) if (plate and self.vehicle_db) else None
+        if match and match.get('method') != 'exact_plate':
             match = None
+
         method = 'exact_plate' if match else 'appearance_histogram_baseline'
-        if not match and confidence < 0.85:
-            candidates = self.vehicle_db.search_by_embedding(appearance(crop), k=1)
-            match = candidates[0] if candidates and candidates[0]['similarity'] >= 0.92 else None
-        identity = (match.get('plate') or match['owner_name']) if match else f'vehicle-{self.session_id[:8]}-{track_id}'
+        appearance_model = 'colour histogram baseline'
+        embedding_dim = 768
+
+        # Advisory appearance Re-ID fallback when OCR confidence is below authorization threshold (< 0.85)
+        if not match and confidence < 0.85 and self.vehicle_db:
+            # 1. Attempt deep metric vehicle Re-ID (OSNet-AIN 512-D)
+            if self.vehicle_reid is not None:
+                try:
+                    deep_emb = self.vehicle_reid.extract_embedding(crop)
+                    candidates = self.vehicle_db.search_by_embedding(deep_emb, k=1)
+                    reid_thresh = getattr(self.vehicle_reid, 'threshold', 0.70)
+                    if candidates and candidates[0].get('similarity', 0) >= reid_thresh:
+                        match = candidates[0]
+                        method = 'deep_reid'
+                        appearance_model = 'osnet_ain_x1_0_vehicle_reid'
+                        embedding_dim = 512
+                except Exception:
+                    match = None
+
+            # 2. Fall back to color histogram baseline (768-D) if deep Re-ID yielded no match
+            if not match:
+                hist_emb = appearance(crop)
+                candidates = self.vehicle_db.search_by_embedding(hist_emb, k=1)
+                if candidates and candidates[0].get('similarity', 0) >= 0.92:
+                    match = candidates[0]
+                    method = 'appearance_histogram_baseline'
+                    appearance_model = 'colour histogram baseline'
+                    embedding_dim = 768
+
+        identity = (match.get('plate') or match.get('owner_name')) if match else f'vehicle-{self.session_id[:8]}-{track_id}'
         name = f"{match['owner_name']} / {match.get('plate','')}" if match else f"Unknown vehicle #{track_id}" + (f' / {plate}' if plate else '')
-        return {'kind':'access_granted' if match else 'stranger_alert','identity':identity,
-                'confidence':confidence if method=='exact_plate' else (match['similarity'] if match else 0),
-                'method':method,'text':name,
-                'color':(0,170,0) if match and method=='exact_plate' and confidence>=.85 else (0,170,255) if match else (0,0,230),
-                'meta':{'plate':plate,'ocr_confidence':confidence,'track_id':track_id,'appearance_model':'colour histogram baseline'}}
+        return {
+            'kind': 'access_granted' if match else 'stranger_alert',
+            'identity': identity,
+            'confidence': confidence if method == 'exact_plate' else (match.get('similarity', 0) if match else 0),
+            'method': method,
+            'text': name,
+            'color': (0, 170, 0) if match and method == 'exact_plate' and confidence >= 0.85 else (0, 170, 255) if match else (0, 0, 230),
+            'meta': {
+                'plate': plate,
+                'ocr_confidence': confidence,
+                'track_id': track_id,
+                'appearance_model': appearance_model,
+                'embedding_dim': embedding_dim,
+                'advisory_match': (method != 'exact_plate')
+            }
+        }

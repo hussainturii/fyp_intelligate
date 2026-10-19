@@ -12,10 +12,81 @@ import numpy as np
 from loguru import logger
 
 
+def validate_camera_url(
+    url: str,
+    allowed_schemes: tuple[str, ...] = ('http', 'https'),
+    allowed_ports: tuple[int, ...] | None = None,
+    allow_private_only: bool = True,
+) -> tuple[bool, str, str]:
+    """
+    Validate remote camera URL against SSRF and network isolation boundaries.
+    Enforces scheme, port whitelist, domain resolution, private RFC1918 range,
+    and strictly forbids loopback (127.0.0.1/localhost) and link-local (169.254.169.254).
+    """
+    import os
+    import socket
+    import ipaddress
+    from urllib.parse import urlparse
+
+    if not url or not isinstance(url, str):
+        return False, 'URL must be a non-empty string', ''
+
+    url = url.strip()
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        return False, f'Malformed URL: {exc}', ''
+
+    if parsed.scheme.lower() not in allowed_schemes:
+        return False, f"Scheme '{parsed.scheme}' not allowed. Must be one of: {', '.join(allowed_schemes)}", ''
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False, 'Missing hostname in camera URL', ''
+
+    port = parsed.port or (80 if parsed.scheme.lower() == 'http' else 443)
+    if allowed_ports is not None:
+        if port not in allowed_ports:
+            return False, f'Port {port} is not in the allowed camera ports list', ''
+    else:
+        if port not in (80, 443) and not (1024 <= port <= 65535):
+            return False, f'Port {port} is restricted. Only standard web ports (80, 443) and ports 1024-65535 are permitted.', ''
+
+    allow_loopback = os.environ.get('INTELLIGATE_ALLOW_LOOPBACK_CAM', '0') == '1'
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if not addr_info:
+            return False, f"Could not resolve host '{hostname}'", ''
+        resolved_ip_str = addr_info[0][4][0]
+        ip = ipaddress.ip_address(resolved_ip_str)
+    except Exception as exc:
+        return False, f"DNS resolution failed for '{hostname}': {exc}", ''
+
+    if ip.is_loopback:
+        if not allow_loopback:
+            return False, 'Loopback addresses (localhost/127.0.0.1) are forbidden for remote cameras', ''
+
+    if ip.is_link_local:
+        return False, 'Link-local addresses (e.g. cloud metadata 169.254.169.254) are forbidden', ''
+
+    if ip.is_multicast or ip.is_reserved:
+        return False, 'Multicast and reserved IP addresses are forbidden', ''
+
+    if allow_private_only and not allow_loopback:
+        if not ip.is_private:
+            return False, f'Public IP addresses ({resolved_ip_str}) are forbidden. Remote camera must be on private LAN (192.168.x.x, 10.x.x.x, 172.16-31.x.x)', ''
+
+    return True, '', url
+
+
 class CameraStream:
-    def __init__(self, cam_index, width=960, height=540, video_path=None, pipeline_func=None):
+    def __init__(self, cam_index, width=960, height=540, video_path=None, pipeline_func=None,
+                 network_url=None, network_token=None):
         self.cam_index, self.width, self.height = cam_index, width, height
         self.video_path = video_path
+        self.network_url = network_url
+        self.network_token = network_token
         self._cap = None
         self._frame = self._snapshot = self._latest = None
         self._running = False
@@ -38,6 +109,14 @@ class CameraStream:
             self._condition.notify_all()
 
     def start(self):
+        if self.network_url:
+            self._running = True
+            self._thread = threading.Thread(target=self._network_capture_loop, daemon=True, name=f'netcapture-{self.cam_index}')
+            self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True, name=f'inference-{self.cam_index}')
+            self._thread.start()
+            self._inference_thread.start()
+            return True
+
         source = self.video_path if self.video_path else self.cam_index
         # DirectShow usually avoids the long MSMF webcam startup on Windows.
         import os
@@ -143,10 +222,96 @@ class CameraStream:
             self.last_error = str(exc)
             logger.exception('Capture failed')
         finally:
-            self._cap.release()
+            if self._cap:
+                self._cap.release()
             with self._condition:
                 self._running = False
                 self._condition.notify_all()
+
+    def _network_capture_loop(self):
+        import urllib.request
+        import urllib.error
+        import time
+
+        started = interval_start = time.monotonic()
+        count = 0
+        headers = {'User-Agent': 'IntelliGate-Camera-Ingestion/2.0'}
+        if self.network_token:
+            headers['X-Camera-Token'] = self.network_token
+            headers['Authorization'] = f'Bearer {self.network_token}'
+
+        req = urllib.request.Request(self.network_url, headers=headers)
+        bytes_buf = bytearray()
+        MAX_FRAME_SIZE = 5 * 1024 * 1024  # 5 MB frame limit
+
+        while self._running:
+            try:
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    self.last_error = None
+                    while self._running:
+                        chunk = resp.read(16384)
+                        if not chunk:
+                            break
+                        bytes_buf.extend(chunk)
+
+                        if len(bytes_buf) > MAX_FRAME_SIZE:
+                            bytes_buf = bytes_buf[-1024 * 1024:]
+
+                        a = bytes_buf.find(b'\xff\xd8')
+                        b = bytes_buf.find(b'\xff\xd9')
+                        if a != -1 and b != -1 and b > a:
+                            jpg_bytes = bytes(bytes_buf[a:b + 2])
+                            del bytes_buf[:b + 2]
+
+                            frame = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if frame is None:
+                                continue
+
+                            scale = min(1, self.width / frame.shape[1])
+                            if scale < 1:
+                                frame = cv2.resize(frame, None, fx=scale, fy=scale)
+                            self.actual_resolution = f'{frame.shape[1]}x{frame.shape[0]}'
+                            self.source_time = time.monotonic() - started
+
+                            with self._condition:
+                                self._snapshot = frame.copy()
+                                self._latest = frame.copy()
+                                self._sequence += 1
+                                pipeline = self._pipeline_func
+                                self._condition.notify_all()
+
+                            preview = frame.copy()
+                            owner = getattr(pipeline, '__self__', None)
+                            if owner is not None and getattr(owner, 'mode', None) == 'low_light':
+                                from .vision import enhance
+                                preview = enhance(preview)
+                            elif owner is not None and hasattr(owner, 'overlay_frame'):
+                                preview = owner.overlay_frame(preview)
+
+                            cv2.putText(preview, f'REMOTE {self.cam_index} | {self.source_time:.1f}s',
+                                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, .6, (255, 255, 255), 2)
+                            if self.last_error:
+                                cv2.putText(preview, 'STREAM NOTICE - reconnecting...', (10, 50), 0, .5, (0, 0, 255), 1)
+
+                            encoded, jpeg = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            if encoded:
+                                with self._lock:
+                                    self._frame = jpeg.tobytes()
+
+                            count += 1
+                            elapsed = time.monotonic() - interval_start
+                            if elapsed >= 1:
+                                self._fps = count / elapsed
+                                interval_start, count = time.monotonic(), 0
+            except Exception as exc:
+                if not self._running:
+                    break
+                self.last_error = f'Remote stream disconnected ({exc})'
+                time.sleep(1.5)
+
+        with self._condition:
+            self._running = False
+            self._condition.notify_all()
 
     def _inference_loop(self):
         last_sequence, next_inference = -1, 0.0
@@ -199,10 +364,12 @@ class CameraManager:
     def __init__(self):
         self._cameras = {}
 
-    def add_camera(self, cam_index, width=960, height=540, video_path=None, pipeline_func=None):
+    def add_camera(self, cam_index, width=960, height=540, video_path=None, pipeline_func=None,
+                   network_url=None, network_token=None):
         if cam_index in self._cameras:
             return self._cameras[cam_index].is_running
-        camera = CameraStream(cam_index,width,height,video_path,pipeline_func)
+        camera = CameraStream(cam_index, width, height, video_path, pipeline_func,
+                              network_url=network_url, network_token=network_token)
         if camera.start():
             self._cameras[cam_index] = camera
             return True
@@ -228,6 +395,7 @@ class CameraManager:
     def list_cameras(self):
         return {index:{'index':index,'running':camera.is_running,'fps':round(camera.fps,1),
                        'resolution':camera.actual_resolution,'replayed':bool(camera.video_path),
+                       'remote':bool(camera.network_url),
                        'source_time_seconds':round(camera.source_time,2),'inference_sampling_fps':5,
                        'inference_fps':round(camera._inference_fps,1),'last_error':camera.last_error,
                        'processing_mode':getattr(getattr(camera._pipeline_func,'__self__',None),'mode','custom'),

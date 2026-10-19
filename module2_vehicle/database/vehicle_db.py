@@ -100,8 +100,8 @@ class VehicleDatabase:
         self,
         db_path:          str = "module2_vehicle/database/vehicles.h5",
         unknown_db_path:  str = "module2_vehicle/database/unknown_vehicles.h5",
-        embedding_dim:    int = 768,
-        reid_threshold:   float = 0.82,
+        embedding_dim:    int = 512,
+        reid_threshold:   float = 0.70,
         fuzzy_threshold:  float = 0.80,
         repeat_alert_count: int = 3,
     ) -> None:
@@ -178,7 +178,17 @@ class VehicleDatabase:
         self._plate_map[plate] = vid
 
         if embedding is not None:
-            self._add_to_auth_index(vid, embedding)
+            emb_arr = embedding.astype(np.float32)
+            if self._auth_index is not None and self._auth_index.ntotal == 0 and emb_arr.shape[0] != self.embedding_dim:
+                self.embedding_dim = emb_arr.shape[0]
+                self._auth_index = faiss.IndexFlatL2(self.embedding_dim)
+            if self._auth_index is not None and emb_arr.shape[0] == self._auth_index.d:
+                self._add_to_auth_index(vid, emb_arr)
+            else:
+                logger.warning(
+                    f"[VehicleDatabase] Embedding dim {emb_arr.shape[0]} != index dim "
+                    f"{self._auth_index.d if self._auth_index else 'None'}; skipped indexing."
+                )
 
         self._save_authorized()
         logger.info(f"[VehicleDatabase] Registered: {plate} ({owner_name}) → {vid[:8]}...")
@@ -248,8 +258,16 @@ class VehicleDatabase:
         if self._auth_index is None or self._auth_index.ntotal == 0:
             return []
 
+        emb_flat = embedding.astype(np.float32).ravel()
+        if emb_flat.shape[0] != self._auth_index.d:
+            logger.debug(
+                f"[VehicleDatabase] Query embedding dimension ({emb_flat.shape[0]}) "
+                f"does not match index dimension ({self._auth_index.d}). Returning empty."
+            )
+            return []
+
         k     = min(k, self._auth_index.ntotal)
-        query = embedding.astype(np.float32).reshape(1, -1)
+        query = emb_flat.reshape(1, -1)
         distances, indices = self._auth_index.search(query, k)
 
         results = []
@@ -410,11 +428,20 @@ class VehicleDatabase:
         self._unknown_id_list.append(uid)
 
     def _rebuild_auth_index(self) -> None:
+        first_emb = next((rec.embedding for rec in self._vehicles.values() if rec.is_active and rec.embedding is not None), None)
+        if first_emb is not None:
+            self.embedding_dim = first_emb.shape[0]
         self._auth_index = faiss.IndexFlatL2(self.embedding_dim)
         self._auth_id_list = []
         for vid, rec in self._vehicles.items():
             if rec.is_active and rec.embedding is not None:
-                self._add_to_auth_index(vid, rec.embedding)
+                if rec.embedding.shape[0] == self.embedding_dim:
+                    self._add_to_auth_index(vid, rec.embedding)
+                else:
+                    logger.warning(
+                        f"[VehicleDatabase] Skipping embedding for {vid}: "
+                        f"dim {rec.embedding.shape[0]} != index dim {self.embedding_dim}"
+                    )
 
     def _search_unknowns(self, emb: np.ndarray, k: int = 1) -> List[Dict]:
         if self._unknown_index.ntotal == 0:

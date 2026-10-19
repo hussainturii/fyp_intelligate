@@ -14,8 +14,11 @@ images/
 *.h5
 *.pt
 *.onnx
+*.pth
 *.partial
 *.key
+scratch/
+runs/
 models/download_manifest.json
 *.jpg
 *.jpeg
@@ -26,8 +29,15 @@ models/download_manifest.json
 *.docx
 *.pptx
 txt.txt
+totally software based.txt
+tools/ocr_review_gallery.html
 module1_face_recognition/anti_spoofing/weights/
 module1_face_recognition/database/*.h5
 module2_vehicle/database/*.h5
 module8_dashboard/frontend/node_modules/
 module8_dashboard/frontend/dist/
+data/
+*.tar
+*.tar.gz
+*.tgz
+*.zip

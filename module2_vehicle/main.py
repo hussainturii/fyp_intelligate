@@ -100,15 +100,15 @@ class IntelliGateModule2:
         )
 
         self.reid = VehicleReID(
-            similarity_threshold=0.82,
+            similarity_threshold=0.70,
             device=self.device,
         )
 
         self.db = VehicleDatabase(
             db_path="module2_vehicle/database/vehicles.h5",
             unknown_db_path="module2_vehicle/database/unknown_vehicles.h5",
-            embedding_dim=768,
-            reid_threshold=0.82,
+            embedding_dim=512,
+            reid_threshold=0.70,
             fuzzy_threshold=0.80,
         )
 

@@ -22,7 +22,11 @@ class SoftwareRuntime:
                 CREATE TABLE IF NOT EXISTS visitor_visits (
                     id INTEGER PRIMARY KEY, identity TEXT, source TEXT, session TEXT, seen REAL,
                     UNIQUE(identity, source, session));
+                CREATE INDEX IF NOT EXISTS idx_review_requests_lookup ON review_requests(identity, status, expires);
+                CREATE INDEX IF NOT EXISTS idx_visitor_visits_seen ON visitor_visits(seen);
+                CREATE INDEX IF NOT EXISTS idx_visitor_visits_identity_seen ON visitor_visits(identity, seen);
             """)
+        self._last_visitor_prune = 0.0
         # Motion never resumes automatically after a process restart.
         state = self.gate()
         if state['state'] in {'OPENING', 'CLOSING', 'OPEN'}:
@@ -119,20 +123,34 @@ class SoftwareRuntime:
                 db.execute("UPDATE review_requests SET status='EXPIRED' WHERE status='PENDING' AND expires<?", (self.clock(),))
             return gate
 
-    def observe(self, event):
-        """Observations are advisory; only explicit validated facts may grant access."""
+    def observe(self, event, trusted: bool | None = None):
+        """Observations are advisory; only explicit validated facts from trusted internal perception may grant access."""
         with self.lock:
             meta = dict(event.get('meta') or {})
             kind, module = event['event_type'], event['module']
             identity = event.get('identity')
             decision, reason = 'REVIEW_REQUIRED', 'Identity or liveness requires operator review'
+
+            # Strict server-controlled trust boundary:
+            # Automatic ALLOW is strictly prohibited unless the caller explicitly passes trusted=True
+            # AND internal perception provenance is established with strict boolean True.
+            # All external, unknown, missing (trusted=None), and untrusted contexts fail closed.
+            is_trusted_perception = (
+                trusted is True
+                and meta.get('provenance') == 'perception_internal'
+                and meta.get('trusted_perception') is True
+            )
+
             if kind in {'spoof', 'spoof_detected'}:
                 decision, reason = 'DENY', 'Liveness checks rejected the input'
             elif kind in {'authorized', 'known', 'access_granted'}:
-                if module == 'vehicle' and event.get('method') == 'exact_plate' and meta.get('ocr_confidence', 0) >= 0.85:
-                    decision, reason = 'ALLOW', 'Registered exact plate with sufficient OCR confidence'
-                elif module == 'face' and meta.get('validated_liveness') is True and meta.get('liveness_score', 0) >= 0.9:
-                    decision, reason = 'ALLOW', 'Registered face and validated liveness'
+                if is_trusted_perception:
+                    if module == 'vehicle' and event.get('method') == 'exact_plate' and meta.get('ocr_confidence', 0) >= 0.85:
+                        decision, reason = 'ALLOW', 'Registered exact plate with sufficient OCR confidence'
+                elif meta.get('provenance') == 'operator_annotation':
+                    decision, reason = 'REVIEW_REQUIRED', 'Operator-submitted event requires manual verification'
+                else:
+                    decision, reason = 'REVIEW_REQUIRED', 'Unverified event provenance requires review'
             if self.gate()['obstruction'] or self.gate()['lockdown']:
                 decision, reason = 'DENY', 'Gate safety interlock is active'
             meta.update(decision=decision, reason=reason, simulated=True)
@@ -148,7 +166,8 @@ class SoftwareRuntime:
                         db.execute('INSERT INTO review_requests VALUES (?,?,?,?,?,?,?)',
                                    (str(uuid.uuid4()), eid, identity, 'PENDING', self.clock(), self.clock() + 120, None))
             elif kind in {'spoof', 'spoof_detected'}:
-                self.store.log_alert('HIGH', 'spoof_attempt', 'Liveness rejection', event_id=eid)
+                alert_desc = 'Operator reported spoof attempt' if meta.get('provenance') == 'operator_annotation' else 'Liveness rejection'
+                self.store.log_alert('HIGH', 'spoof_attempt', alert_desc, event_id=eid)
             if meta.get('stranger_id'):
                 self.visit(meta['stranger_id'], str(event.get('camera_id', 0)), meta.get('session_id', 'default'), self.clock())
             return {'event_id': eid, 'event_type': stored_kind, 'decision': decision, 'reason': reason, 'gate': self.gate(), 'simulated': True}
@@ -177,7 +196,9 @@ class SoftwareRuntime:
         with self.lock:
             cutoff = seen - 86400
             with self.store._conn() as db:
-                db.execute('DELETE FROM visitor_visits WHERE seen<?', (seen - 90 * 86400,))
+                if seen - self._last_visitor_prune > 3600:
+                    db.execute('DELETE FROM visitor_visits WHERE seen<?', (seen - 90 * 86400,))
+                    self._last_visitor_prune = seen
                 db.execute('INSERT OR IGNORE INTO visitor_visits(identity,source,session,seen) VALUES (?,?,?,?)',
                            (identity, source, session, seen))
                 count = db.execute('SELECT COUNT(*) FROM visitor_visits WHERE identity=? AND seen>=? AND seen<=?',

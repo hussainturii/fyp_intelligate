@@ -43,7 +43,8 @@ function eventBadge(type) {
     known:      'badge-green',
     stranger:   'badge-yellow',
     unknown:    'badge-yellow',
-    spoof:      'badge-red',
+    spoof:          'badge-red',
+    spoof_detected: 'badge-red',
   }
   return map[type] || 'badge-gray'
 }

@@ -13,7 +13,8 @@ function badgeClass(type) {
     known:      'badge-green',
     stranger:   'badge-yellow',
     unknown:    'badge-yellow',
-    spoof:      'badge-red',
+    spoof:          'badge-red',
+    spoof_detected: 'badge-red',
   }[type] ?? 'badge-gray'
 }
 

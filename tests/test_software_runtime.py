@@ -97,10 +97,25 @@ def test_spoof_denied_and_alerted(system):
 
 def test_high_confidence_exact_plate_allows_unless_interlocked(system):
     runtime, _, _ = system
-    event = {'module': 'vehicle', 'event_type': 'access_granted', 'method': 'exact_plate', 'meta': {'ocr_confidence': 0.91}}
-    assert runtime.observe(event)['decision'] == 'ALLOW'
+    trusted_event = {
+        'module': 'vehicle',
+        'event_type': 'access_granted',
+        'method': 'exact_plate',
+        'meta': {'ocr_confidence': 0.91, 'provenance': 'perception_internal', 'trusted_perception': True}
+    }
+    assert runtime.observe(trusted_event, trusted=True)['decision'] == 'ALLOW'
     runtime.obstruction(True)
-    assert runtime.observe(event)['decision'] == 'DENY'
+    assert runtime.observe(trusted_event, trusted=True)['decision'] == 'DENY'
+    runtime.obstruction(False)
+
+    # Missing provenance must fail closed and require review
+    unverified_event = {
+        'module': 'vehicle',
+        'event_type': 'access_granted',
+        'method': 'exact_plate',
+        'meta': {'ocr_confidence': 0.91}
+    }
+    assert runtime.observe(unverified_event)['decision'] == 'REVIEW_REQUIRED'
 
 
 def test_expired_review_cannot_open(system):

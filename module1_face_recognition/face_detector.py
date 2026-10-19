@@ -15,8 +15,10 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-import torch
-from facenet_pytorch import MTCNN
+try:
+    from facenet_pytorch import MTCNN
+except ImportError:
+    MTCNN = None
 from loguru import logger
 from PIL import Image
 
